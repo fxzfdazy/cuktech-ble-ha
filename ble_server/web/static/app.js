@@ -401,7 +401,7 @@
             if (vals[1]) vals[1].textContent = merged.current.toFixed(1);
             if (vals[2]) vals[2].textContent = merged.power.toFixed(1);
             // Update protocol label
-            const protoEl = card.querySelector('div[style*="text-align:center"]');
+            const protoEl = card.querySelector('.port-protocol');
             if (protoEl) {
                 protoEl.textContent = merged.protocol;
                 protoEl.style.color = merged.protocol !== 'idle' ? 'var(--accent)' : 'var(--text-dim)';
@@ -469,7 +469,7 @@
                             <div class="port-stat"><div class="port-stat-value">${port.current.toFixed(1)}</div><div class="port-stat-label">电流 A</div></div>
                             <div class="port-stat"><div class="port-stat-value">${port.power.toFixed(1)}</div><div class="port-stat-label">功率 W</div></div>
                         </div>
-                        <div style="text-align:center;margin-top:8px;font-size:11px;color:${protocolColor}">${port.protocol}</div>
+                        <div class="port-protocol" style="text-align:center;margin-top:8px;font-size:11px;color:${protocolColor}">${port.protocol}</div>
                     </div>`;
             }
             grid.innerHTML = html;

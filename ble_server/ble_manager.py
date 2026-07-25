@@ -530,12 +530,6 @@ class BLEManager:
                 if not self.ctrl:
                     break
 
-                # Periodic settings refresh — runs regardless of BLE push activity
-                now = time.time()
-                if now - last_refresh > self.config.server.settings_refresh_interval:
-                    await self._refresh_settings()
-                    last_refresh = time.time()
-
                 try:
                     data = await asyncio.wait_for(
                         self.ctrl.wait_notify("cmd_recv"), timeout=2.0)
@@ -546,6 +540,12 @@ class BLEManager:
                     self._total_frames += 1
                 except asyncio.TimeoutError:
                     now = time.time()
+                    # Refresh settings during idle (no BLE push — avoids data loss from drain)
+                    if now - last_refresh > self.config.server.settings_refresh_interval:
+                        await self._refresh_settings()
+                        now = time.time()
+                        last_refresh = now
+                        last_notify = now
                     if now - last_keepalive > 10:
                         if self.ctrl and self.ctrl.client and self.ctrl.client.is_connected:
                             try:
@@ -697,7 +697,7 @@ class BLEManager:
         if port_info is not None:
             # Caller provided data (e.g. BLE push decoded data)
             data = dict(port_info)
-            data["enabled"] = is_enabled and port_info.get("active", False)
+            data["enabled"] = is_enabled  # PIID 16 port control; port_info.active tells device presence
         elif is_enabled:
             # Port enabled — use current state
             ps = self.state.ports.get(piid)
@@ -791,12 +791,16 @@ class BLEManager:
                 if port == "all":
                     for piid in range(1, 5):
                         if not bool(new_val & (1 << (piid - 1))):
+                            if piid in self._active_sessions:
+                                self._close_session(piid, time.time())
                             await self.state.update_port(piid, PORT_DEFAULT)
                         self._emit_port_state(piid)
                 else:
                     piid = {"c1": 1, "c2": 2, "c3": 3, "a": 4}.get(port)
                     if piid:
                         if action == "off":
+                            if piid in self._active_sessions:
+                                self._close_session(piid, time.time())
                             await self.state.update_port(piid, PORT_DEFAULT)
                         self._emit_port_state(piid)
                 _invalidate()
@@ -927,7 +931,7 @@ class BLEManager:
                                 self._active_sessions[p] = t.result()
                         task.add_done_callback(_on_session_start)
 
-                elif not active and es.is_charging and piid in self._active_sessions:
+                elif not active and es.is_charging:
                     # Port closed — end session immediately (no debounce needed)
                     self._low_current_count[piid] = 0
                     self._close_session(piid, timestamp, voltage, current)
