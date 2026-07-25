@@ -55,98 +55,49 @@ Then open `http://<server-ip>:8199/config.html`:
 
 ### Option B: Docker
 
-```bash
-docker run -d \
-  --name cuktech-ble --network host --privileged --restart unless-stopped \
-  -v $(pwd)/config.yaml:/app/config.yaml:ro \
-  -v $(pwd)/data:/data \
-  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
-  -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
-  ghcr.io/kairui1108/cuktech-ble-server:latest
-# Then open http://<server-ip>:8199/config.html to complete setup
-```
-
-Image ships with a default `config.yaml` (from `config.yaml.example`). You can override settings via volume mount or environment variables.
-
-#### Run with default config (quick try):
+#### Run with persistent data directory (recommended):
 
 ```bash
 docker run -d \
   --name cuktech-ble --network host --privileged --restart unless-stopped \
-  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
   -v $(pwd)/data:/data \
+  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
+  -e CUKTECH_CONFIG_PATH=/data/config.yaml \
   -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
   ghcr.io/kairui1108/cuktech-ble-server:latest
 # Then open http://<server-ip>:8199/config.html to configure via web UI
+# All config changes are saved to ./data/config.yaml and persist across restarts
+```
 ```
 
-#### Run with mounted config:
+### Docker Compose
 
 ```bash
-# 1. Create config file
-cat > config.yaml << EOF
+# Option 1: Clone repo and copy template
+git clone https://github.com/kairui1108/cuktech-ble-ha.git
+cd kuktech-ble-ha/ble_server
+cp config.yaml.example config.yaml
+
+# Option 2: Create config directly (no clone needed)
+cat > config.yaml << 'EOF'
 ble:
   mac: "XX:XX:XX:XX:XX:XX"
-  token: "your_token_12bytes_hex"
-  ble_key: "your_ble_key_16bytes_hex"
+  token: ""
+  ble_key: ""
 mqtt:
   enabled: true
   host: ""
   port: 1883
-  username: ""
-  password: ""
-  keepalive: 60
-  topic_prefix: "cuktech/charger"
-
 server:
-  host: "0.0.0.0"
   port: 8199
-  command_timeout: 10.0
-  reconnect_base_delay: 1.0
-  reconnect_max_delay: 300.0
   settings_refresh_interval: 10.0
-  log_level: "error"
-  history_retention_days: 2
-  history_db_path: ""
-
-bemfa:
-  enabled: false
-  uid: ""
-  name_c1: "C口1开关"
-  name_c2: "C口2开关"
-  name_c3: "C口3开关"
-  name_a: "USB-A开关"
-  name_ble: "蓝牙开关"
 EOF
 
-# 2. Run container
-docker run -d \
-  --name cuktech-ble \
-  --network host \
-  --privileged \
-  --restart unless-stopped \
-  -v $(pwd)/config.yaml:/app/config.yaml:ro \
-  -v $(pwd)/data:/data \
-  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
-  -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
-  ghcr.io/kairui1108/cuktech-ble-server:latest
-
-# 3. Check logs
-docker logs -f cuktech-ble
+# Start
+docker compose up -d
 ```
 
-### Docker Compose pull & run (recommended)
-
-```bash
-git clone https://github.com/kairui1108/cuktech-ble-ha.git
-cd cuktech-ble-ha
-
-# edit config, fill in your device info
-vim ble_server/docker/docker-compose.pull.yml
-
-# pull image and start (no local build needed)
-docker compose -f ble_server/docker/docker-compose.pull.yml up -d
-```
+> **Warning**: If `config.yaml` does not exist when Docker Compose starts, Docker will create a **directory** instead of a file. Use `cp` or `cat` to create a valid file with defaults.
 
 ### Build locally
 

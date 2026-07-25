@@ -142,7 +142,7 @@ class Server:
         if self.bemfa:
             await self.bemfa.stop()
 
-        self.bemfa = BemfaClient(self.config.bemfa.uid)
+        self.bemfa = BemfaClient(self.config.bemfa.uid, modified=self.config.bemfa.modified)
 
         # Register devices with custom display names
         self.bemfa.add_device("cuktech_c1", self.config.bemfa.name_c1)
@@ -182,6 +182,29 @@ class Server:
         self.bemfa.on_command("cuktech_ble", _ble_cmd)
 
         await self.bemfa.start()
+
+        # Clear modified flag after successful topic registration
+        if self.config.bemfa.modified:
+            self._clear_bemfa_modified()
+
+    def _config_path(self) -> Path:
+        return Path(os.environ.get("CUKTECH_CONFIG_PATH", str(Path(__file__).parent / "config.yaml")))
+
+    def _clear_bemfa_modified(self):
+        """Set bemfa.modified=false in config.yaml after topic re-registration."""
+        try:
+            import yaml
+            config_path = self._config_path()
+            if config_path.exists():
+                with open(config_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                if cfg.get("bemfa", {}).get("modified"):
+                    cfg["bemfa"]["modified"] = False
+                    with open(config_path, "w") as f:
+                        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+                    _LOGGER.info("Bemfa modified flag cleared")
+        except Exception:
+            _LOGGER.warning("Failed to clear bemfa modified flag", exc_info=True)
 
     async def handle_bemfa(self, request):
         """GET /api/bemfa - get Bemfa status."""
@@ -521,7 +544,7 @@ class Server:
         # Persist to config.yaml so the change survives restart
         try:
             import yaml
-            config_path = Path(__file__).parent / "config.yaml"
+            config_path = self._config_path()
             if config_path.exists():
                 with open(config_path) as f:
                     cfg = yaml.safe_load(f) or {}
@@ -898,7 +921,7 @@ class Server:
             return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
 
         config_data = data.get("config", {})
-        config_path = Path(__file__).parent / "config.yaml"
+        config_path = self._config_path()
 
         try:
             import yaml
@@ -918,6 +941,19 @@ class Server:
                         if k in SENSITIVE_KEYS and v and "****" in str(v):
                             continue  # Skip masked values, keep original
                         existing[section][k] = v
+
+            # Detect bemfa name changes → set modified flag for topic re-registration
+            if "bemfa" in config_data:
+                bemfa_existing = existing.get("bemfa", {})
+                NAME_KEYS = {"name_c1", "name_c2", "name_c3", "name_a", "name_ble"}
+                old_names = {}
+                if config_path.exists():
+                    with open(config_path) as f:
+                        old_cfg = yaml.safe_load(f) or {}
+                        old_names = {k: old_cfg.get("bemfa", {}).get(k) for k in NAME_KEYS}
+                new_names = {k: config_data["bemfa"].get(k) for k in NAME_KEYS}
+                if old_names != new_names:
+                    bemfa_existing["modified"] = True
 
             with open(config_path, "w") as f:
                 yaml.dump(existing, f, allow_unicode=True, default_flow_style=False)

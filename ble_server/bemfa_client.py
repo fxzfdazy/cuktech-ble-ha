@@ -64,8 +64,9 @@ class BemfaDevice:
 class BemfaClient:
     """Bemfa cloud MQTT client with HTTP topic registration."""
 
-    def __init__(self, uid: str):
+    def __init__(self, uid: str, modified: bool = False):
         self._uid = uid
+        self._modified = modified
         self._client: Optional[mqtt.Client] = None
         self._devices: dict[str, BemfaDevice] = {}
         self._state_cache: dict[str, str] = {}  # topic -> "on"/"off"
@@ -254,20 +255,23 @@ class BemfaClient:
     # ---- HTTP API ----
 
     async def _register_topics(self):
-        """Delete and re-register all device topics to ensure names are up to date."""
-        _LOGGER.info("Bemfa registering %d topics...", len(self._devices))
+        """Register topics with Bemfa. Deletes existing topics first only when names changed."""
+        _LOGGER.info("Bemfa registering %d topics... (modified=%s)", len(self._devices), self._modified)
         async with aiohttp.ClientSession() as session:
             for dev in self._devices.values():
-                try:
-                    del_resp = await session.post(
-                        DELETE_TOPIC_URL,
-                        data={"uid": self._uid, "topic": dev.topic, "type": 1},
-                        timeout=aiohttp.ClientTimeout(total=5),
-                    )
-                    _LOGGER.info("Bemfa delete %s: HTTP %d %s", dev.topic, del_resp.status, await del_resp.text())
-                except Exception as e:
-                    _LOGGER.warning("Bemfa delete error: %s: %s", dev.topic, e)
-                await asyncio.sleep(0.1)
+                if self._modified:
+                    # Names changed — delete old topic before re-creating
+                    try:
+                        del_resp = await session.post(
+                            DELETE_TOPIC_URL,
+                            data={"uid": self._uid, "topic": dev.topic, "type": 1},
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        )
+                        _LOGGER.info("Bemfa delete %s: HTTP %d %s", dev.topic, del_resp.status, await del_resp.text())
+                    except Exception as e:
+                        _LOGGER.warning("Bemfa delete error: %s: %s", dev.topic, e)
+                    await asyncio.sleep(0.1)
+
                 try:
                     add_resp = await session.post(
                         CREATE_TOPIC_URL,

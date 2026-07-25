@@ -21,7 +21,7 @@ LOG_LEVELS = {
 
 def _load_yaml_config():
     """Load config from YAML file if exists."""
-    config_path = Path(__file__).parent / "config.yaml"
+    config_path = Path(os.environ.get("CUKTECH_CONFIG_PATH", str(Path(__file__).parent / "config.yaml")))
     if not config_path.exists():
         config_path = Path.cwd() / "config.yaml"
     if not config_path.exists():
@@ -81,6 +81,7 @@ class BemfaConfig:
     name_c3: str = "C口3开关"
     name_a: str = "USB-A开关"
     name_ble: str = "蓝牙开关"
+    modified: bool = False  # set true when names change, triggers topic delete+recreate on next start
 
 
 @dataclass
@@ -176,6 +177,7 @@ def load_config() -> Config:
         name_c3=bemfa_cfg.get("name_c3", "C口3开关"),
         name_a=bemfa_cfg.get("name_a", "USB-A开关"),
         name_ble=bemfa_cfg.get("name_ble", "蓝牙开关"),
+        modified=bemfa_cfg.get("modified", False),
     )
 
     return Config(ble=ble, mqtt=mqtt, server=server, bemfa=bemfa)

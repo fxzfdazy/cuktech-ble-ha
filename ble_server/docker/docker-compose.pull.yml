@@ -9,11 +9,12 @@ services:
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
       - ./cuktech-data:/data
     environment:
+      - CUKTECH_CONFIG_PATH=/data/config.yaml
       - CUKTECH_SERVER_PORT=8199
       - CUKTECH_HISTORY_DB_PATH=/data/port_history.db
       - TZ=Asia/Shanghai
 
-      # 设备信息（必填）
+      # 设备信息（选填，可通过config.html自动获取）
       - CUKTECH_DEVICE_MAC=XX:XX:XX:XX:XX:XX
       - CUKTECH_DEVICE_TOKEN=
       - CUKTECH_DEVICE_BLE_KEY=

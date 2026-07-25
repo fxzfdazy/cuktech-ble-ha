@@ -91,72 +91,61 @@ vim config.yaml
 
 ### 方式三：Docker 部署
 
-镜像内置默认 `config.yaml`（来自 `config.yaml.example`），可通过环境变量或挂载卷覆盖配置。
+镜像内置默认 `config.yaml`（来自 `config.yaml.example`），首次启动无需配置文件。
 
-#### 使用默认配置启动（推荐）：
+#### 推荐方式（数据持久化）：
 
 ```bash
+# 创建数据目录
+mkdir -p data
+
 docker run -d \
   --name cuktech-ble \
   --network host \
   --privileged \
   --restart unless-stopped \
-  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
   -v $(pwd)/data:/data \
+  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
+  -e CUKTECH_CONFIG_PATH=/data/config.yaml \
   -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
   ghcr.io/kairui1108/cuktech-ble-server:latest
-# 然后访问 http://<服务器IP>:8199/config.html 通过 Web 页面配置
+
+# 访问 http://<服务器IP>:8199/config.html 通过 Web 页面配置
+# 配置自动保存到 ./data/config.yaml，重启后保留
 ```
 
-#### 拉取镜像直接运行
-
-```bash
-# 1. 创建配置文件
-cat > config.yaml << EOF
-ble:
-  mac: "XX:XX:XX:XX:XX:XX"
-  token: "your_token_hex"
-  ble_key: "your_ble_key_hex"
-mqtt:
-  enabled: true
-  host: ""
-  port: 1883
-  username: ""
-  password: ""
-  topic_prefix: "cuktech/charger"
-server:
-  port: 8199
-  settings_refresh_interval: 10.0
-  log_level: "error"
-bemfa:
-  enabled: false
-  uid: ""
-EOF
-
-# 2. 运行容器
-docker run -d \
-  --name cuktech-ble \
-  --network host \
-  --privileged \
-  --restart unless-stopped \
-  -v $(pwd)/config.yaml:/app/config.yaml:ro \
-  -v $(pwd)/data:/data \
-  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
-  -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
-  ghcr.io/kairui1108/cuktech-ble-server:latest
-
-# 3. 通过 Web 配置页面完善配置
-#    http://<服务器IP>:8199/config.html
+同一份 `config.yaml` 可同时包含 BLE 参数和 Web 页面中设置的所有配置项，详参 [`config.yaml.example`](config.yaml.example)。
 ```
 
 #### Docker Compose
 
 ```bash
+# 创建配置文件（不要用 touch，空文件会覆盖容器内默认配置）
+# 方式一：克隆仓库后复制模板
 git clone https://github.com/kairui1108/cuktech-ble-ha.git
-cd cuktech-ble-ha
-vim ble_server/docker/docker-compose.pull.yml  # 编辑配置
-docker compose -f ble_server/docker/docker-compose.pull.yml up -d
+cd kuktech-ble-ha/ble_server
+cp config.yaml.example config.yaml
+
+# 方式二：直接写入默认配置（无需 clone）
+cat > config.yaml << 'EOF'
+ble:
+  mac: "XX:XX:XX:XX:XX:XX"
+  token: ""
+  ble_key: ""
+mqtt:
+  enabled: true
+  host: ""
+  port: 1883
+server:
+  port: 8199
+  settings_refresh_interval: 10.0
+EOF
+
+# 启动
+docker compose up -d
 ```
+
+> **重要**：`docker-compose.yml` 中 `./config.yaml:/app/config.yaml` 挂载时，如果文件不存在，Docker 会创建一个**目录**而非文件。使用 `cp` 或 `cat` 确保文件存在且包含默认值。
 
 ## Web 管理界面
 
