@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>CUKTECH 配置</title>
+<link rel="stylesheet" href="static/phone.css">
+<style>
+/* Config page overrides */
+.config-section { margin-top: 12px; }
+.config-section-title {
+    font-size: 12px; font-weight: 600; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 1px;
+    margin-bottom: 8px; padding: 0 4px;
+}
+.config-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+body.light .config-row { border-bottom-color: rgba(0,0,0,0.06); }
+.config-row:last-child { border-bottom: none; }
+.config-label { font-size: 15px; color: var(--text); }
+.config-hint { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+.config-input {
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px; padding: 8px 12px; color: var(--text); font-size: 14px;
+    width: 180px; text-align: right; outline: none; transition: border-color 0.2s;
+}
+body.light .config-input {
+    background: rgba(0,0,0,0.04); border-color: rgba(0,0,0,0.12);
+}
+.config-input:focus { border-color: var(--accent); }
+.config-input::placeholder { color: var(--text-dim); }
+.config-select {
+    background: var(--card-bg); border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px; padding: 8px 12px; color: var(--text); font-size: 14px;
+    outline: none; min-width: 100px;
+}
+body.light .config-select { border-color: rgba(0,0,0,0.12); }
+.btn-save {
+    width: 100%; padding: 14px; border: none; border-radius: 12px;
+    background: var(--accent); color: var(--text); font-size: 15px; font-weight: 600;
+    cursor: pointer; transition: all 0.2s; margin-top: 12px;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+}
+.btn-save:active { transform: scale(0.97); opacity: 0.9; }
+.btn-save:disabled { opacity: 0.5; cursor: not-allowed; }
+.status-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 0; font-size: 13px; color: var(--text-dim);
+}
+.status-dot-sm { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); }
+.status-dot-sm.ok { background: #34C759; }
+.status-dot-sm.err { background: #FF3B30; }
+</style>
+</head>
+<body>
+<div class="phone" id="app">
+    <!-- Top Navigation -->
+    <div class="navbar">
+        <div class="nav-back" onclick="history.back()" style="cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--text);">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity:0.7;">
+                <polyline points="15 18 9 12 15 6"></polyline>
+            </svg>
+        </div>
+        <div class="nav-title">系统配置</div>
+        <div class="theme-btn" id="themeBtn" onclick="toggleTheme()" style="width:28px;height:28px;cursor:pointer;font-size:18px;line-height:28px;text-align:center;">☀️</div>
+    </div>
+
+    <div class="bottom-view" style="padding-top:12px;">
+
+        <!-- BLE Config -->
+        <div class="card config-section">
+            <div class="config-section-title" style="display:flex;align-items:center;justify-content:space-between;">
+                <span>BLE 设备</span>
+                <span onclick="openXiaomiModal()" style="font-size:10px;color:var(--accent);cursor:pointer;">小米云自动获取 &#8599;</span>
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">MAC 地址</div><div class="config-hint">充电器蓝牙 MAC 地址</div></div>
+                <input class="config-input" id="ble_mac" placeholder="AA:BB:CC:DD:EE:FF">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">Token</div><div class="config-hint">设备认证 Token (十六进制)</div></div>
+                <input class="config-input" id="ble_token" placeholder="Token">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">BLE Key</div><div class="config-hint">加密密钥 (十六进制)</div></div>
+                <input class="config-input" id="ble_key" placeholder="BLE Key">
+            </div>
+        </div>
+
+        <!-- MQTT Config -->
+        <div class="card config-section">
+            <div class="config-section-title">MQTT (Home Assistant)</div>
+            <div class="config-row">
+                <div class="config-label">启用 MQTT</div>
+                <label class="toggle"><input type="checkbox" id="mqtt_enabled"><span class="toggle-slider"></span></label>
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">服务器</div><div class="config-hint">MQTT Broker 地址</div></div>
+                <input class="config-input" id="mqtt_host" placeholder="localhost">
+            </div>
+            <div class="config-row">
+                <div class="config-label">端口</div>
+                <input class="config-input" id="mqtt_port" type="number" value="1883" style="width:80px;">
+            </div>
+            <div class="config-row">
+                <div class="config-label">用户名</div>
+                <input class="config-input" id="mqtt_username" placeholder="可选">
+            </div>
+            <div class="config-row">
+                <div class="config-label">密码</div>
+                <input class="config-input" id="mqtt_password" type="password" placeholder="可选">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">Topic 前缀</div><div class="config-hint">MQTT 主题前缀</div></div>
+                <input class="config-input" id="mqtt_topic" placeholder="cuktech/charger">
+            </div>
+        </div>
+
+        <!-- Bemfa Config -->
+        <div class="card config-section">
+            <div class="config-section-title">巴法云 <a href="https://cloud.bemfa.com/tcp/devicemqtt.html" target="_blank" style="font-size:10px;color:var(--accent);font-weight:400;text-transform:none;letter-spacing:0;">注册获取私钥 &#8599;</a></div>
+            <div class="config-row">
+                <div class="config-label">启用巴法云</div>
+                <label class="toggle"><input type="checkbox" id="bemfa_enabled"><span class="toggle-slider"></span></label>
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">私钥</div><div class="config-hint">巴法云用户 私钥</div></div>
+                <input class="config-input" id="bemfa_uid" placeholder="巴法云 私钥">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">C1 端口名称</div><div class="config-hint">巴法云设备显示名</div></div>
+                <input class="config-input" id="bemfa_name_c1" placeholder="C口1开关">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">C2 端口名称</div><div class="config-hint">巴法云设备显示名</div></div>
+                <input class="config-input" id="bemfa_name_c2" placeholder="C口2开关">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">C3 端口名称</div><div class="config-hint">巴法云设备显示名</div></div>
+                <input class="config-input" id="bemfa_name_c3" placeholder="C口3开关">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">USB-A 端口名称</div><div class="config-hint">巴法云设备显示名</div></div>
+                <input class="config-input" id="bemfa_name_a" placeholder="USB-A开关">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">蓝牙状态名称</div><div class="config-hint">巴法云设备显示名</div></div>
+                <input class="config-input" id="bemfa_name_ble" placeholder="蓝牙开关">
+            </div>
+        </div>
+
+        <!-- Server Config -->
+        <div class="card config-section">
+            <div class="config-section-title">服务器</div>
+            <div class="config-row">
+                <div class="config-label">Web 端口</div>
+                <input class="config-input" id="server_port" type="number" value="8199" style="width:80px;">
+            </div>
+            <div class="config-row">
+                <div class="config-label">数据保留天数</div>
+                <input class="config-input" id="server_retention" type="number" value="2" style="width:80px;">
+            </div>
+        </div>
+
+        <!-- Status -->
+        <div class="card config-section">
+            <div class="config-section-title">当前状态</div>
+            <div class="status-row">
+                <div class="status-dot-sm" id="statusDot"></div>
+                <span id="statusText">加载中...</span>
+            </div>
+        </div>
+
+        <!-- Save Button -->
+        <div style="padding: 0 0 20px;">
+            <button class="btn-save" id="btnSave" onclick="saveConfig()">
+                <span id="btnSaveIcon">&#9881;</span> <span id="btnSaveText">保存配置并重启</span>
+            </button>
+        </div>
+
+    </div>
+</div>
+
+<script>
+const API = window.location.origin;
+let isDark = true;
+
+// Theme (shared with phone.html)
+function toggleTheme() {
+    isDark = !isDark;
+    document.body.classList.toggle('light', !isDark);
+    document.getElementById('themeBtn').textContent = isDark ? '☀️' : '🌙';
+    localStorage.setItem('cuktech-config-theme', isDark ? 'dark' : 'light');
+}
+// Load saved theme
+(function() {
+    const saved = localStorage.getItem('cuktech-config-theme');
+    if (saved === 'light') { isDark = false; document.body.classList.add('light'); document.getElementById('themeBtn').textContent = '🌙'; }
+})();
+
+function showToast(msg, duration) {
+    let t = document.getElementById('toast');
+    if (!t) {
+        t = document.createElement('div');
+        t.id = 'toast';
+        t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:999;background:rgba(0,0,0,0.85);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;pointer-events:none;transition:opacity 0.3s;opacity:0;white-space:nowrap;';
+        document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.style.opacity = '1';
+    setTimeout(() => { t.style.opacity = '0'; }, duration || 3000);
+}
+
+async function loadConfig() {
+    try {
+        const res = await fetch(`${API}/api/config`);
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error);
+        const c = data.config;
+
+        document.getElementById('ble_mac').value = c.ble.mac || '';
+        document.getElementById('ble_token').value = c.ble.token || '';
+        document.getElementById('ble_key').value = c.ble.ble_key || '';
+
+        document.getElementById('mqtt_enabled').checked = c.mqtt.enabled;
+        document.getElementById('mqtt_host').value = c.mqtt.host || '';
+        document.getElementById('mqtt_port').value = c.mqtt.port || 1883;
+        document.getElementById('mqtt_username').value = c.mqtt.username || '';
+        document.getElementById('mqtt_password').value = c.mqtt.password || '';
+        document.getElementById('mqtt_topic').value = c.mqtt.topic_prefix || '';
+
+        document.getElementById('bemfa_enabled').checked = c.bemfa.enabled;
+        document.getElementById('bemfa_uid').value = c.bemfa.uid || '';
+        document.getElementById('bemfa_name_c1').value = c.bemfa.name_c1 || '';
+        document.getElementById('bemfa_name_c2').value = c.bemfa.name_c2 || '';
+        document.getElementById('bemfa_name_c3').value = c.bemfa.name_c3 || '';
+        document.getElementById('bemfa_name_a').value = c.bemfa.name_a || '';
+        document.getElementById('bemfa_name_ble').value = c.bemfa.name_ble || '';
+
+        document.getElementById('server_port').value = c.server.port || 8199;
+        document.getElementById('server_retention').value = c.server.history_retention_days || 2;
+
+        document.getElementById('statusDot').className = 'status-dot-sm ok';
+        document.getElementById('statusText').textContent = '配置已加载';
+    } catch (e) {
+        document.getElementById('statusDot').className = 'status-dot-sm err';
+        document.getElementById('statusText').textContent = '加载失败: ' + e.message;
+    }
+}
+
+async function saveConfig() {
+    const btn = document.getElementById('btnSave');
+    btn.disabled = true;
+    document.getElementById('btnSaveIcon').textContent = '⏳';
+    document.getElementById('btnSaveText').textContent = '保存中...';
+
+    const config = {
+        ble: {
+            mac: document.getElementById('ble_mac').value.trim(),
+            token: document.getElementById('ble_token').value.trim(),
+            ble_key: document.getElementById('ble_key').value.trim(),
+        },
+        mqtt: {
+            enabled: document.getElementById('mqtt_enabled').checked,
+            host: document.getElementById('mqtt_host').value.trim(),
+            port: parseInt(document.getElementById('mqtt_port').value) || 1883,
+            username: document.getElementById('mqtt_username').value.trim(),
+            password: document.getElementById('mqtt_password').value,
+            topic_prefix: document.getElementById('mqtt_topic').value.trim() || 'cuktech/charger',
+        },
+        bemfa: {
+            enabled: document.getElementById('bemfa_enabled').checked,
+            uid: document.getElementById('bemfa_uid').value.trim(),
+            name_c1: document.getElementById('bemfa_name_c1').value.trim() || 'C口1开关',
+            name_c2: document.getElementById('bemfa_name_c2').value.trim() || 'C口2开关',
+            name_c3: document.getElementById('bemfa_name_c3').value.trim() || 'C口3开关',
+            name_a: document.getElementById('bemfa_name_a').value.trim() || 'USB-A开关',
+            name_ble: document.getElementById('bemfa_name_ble').value.trim() || '蓝牙开关',
+        },
+        server: {
+            port: parseInt(document.getElementById('server_port').value) || 8199,
+            history_retention_days: parseInt(document.getElementById('server_retention').value) || 2,
+        },
+    };
+
+    try {
+        const res = await fetch(`${API}/api/config`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ config })
+        });
+        const data = await res.json();
+        if (data.ok) {
+            showToast('配置已保存，服务正在重启...');
+            setTimeout(() => window.location.reload(), 5000);
+        } else {
+            showToast('保存失败: ' + (data.error || '未知错误'), 5000);
+            btn.disabled = false;
+            document.getElementById('btnSaveIcon').textContent = '⚙';
+            document.getElementById('btnSaveText').textContent = '保存配置并重启';
+        }
+    } catch (e) {
+        showToast('网络错误: ' + e.message, 5000);
+        btn.disabled = false;
+        document.getElementById('btnSaveIcon').textContent = '⚙';
+        document.getElementById('btnSaveText').textContent = '保存配置并重启';
+    }
+}
+
+loadConfig();
+
+// ── Xiaomi Cloud Modal ──
+let _xiaomiServer = '', _xiaomiSessionId = '', _xiaomiQRActive = false;
+
+function openXiaomiModal() {
+    document.getElementById('xiaomiModal').style.display = 'flex';
+    document.getElementById('xiaomiLoginForm').style.display = _xiaomiQRActive ? 'none' : 'block';
+    document.getElementById('xiaomiQRForm').style.display = _xiaomiQRActive ? 'block' : 'none';
+    document.getElementById('xiaomiDeviceList').style.display = 'none';
+    document.getElementById('xiaomiLoginStatus').textContent = '';
+}
+
+function closeXiaomiModal() {
+    document.getElementById('xiaomiModal').style.display = 'none';
+}
+
+async function xiaomiStartQR() {
+    if (_xiaomiQRActive) return; // Prevent double-click
+    const btn = document.getElementById('xiaomiLoginBtn');
+    const status = document.getElementById('xiaomiLoginStatus');
+    const server = document.getElementById('xiaomi_server').value;
+
+    btn.disabled = true; btn.textContent = '获取中...';
+    status.textContent = '正在连接小米云...';
+    status.style.color = 'var(--text-dim)';
+
+    try {
+        const res = await fetch(`${API}/api/xiaomi/login`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ server })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+            status.textContent = data.error || '获取二维码失败';
+            status.style.color = 'var(--danger)';
+            btn.disabled = false; btn.textContent = '获取二维码';
+            return;
+        }
+
+        _xiaomiServer = server;
+        _xiaomiSessionId = data.session_id;
+        _xiaomiQRActive = true;
+
+        // Show QR code
+        document.getElementById('xiaomiLoginForm').style.display = 'none';
+        document.getElementById('xiaomiQRForm').style.display = 'block';
+
+        // Display QR image (base64 from server)
+        const qrImg = document.getElementById('xiaomiQRImg');
+        if (data.qr_image) {
+            qrImg.innerHTML = `<img src="${data.qr_image}" style="width:200px;height:200px;">`;
+        } else {
+            qrImg.innerHTML = '<div style="padding:40px;color:var(--text-dim);">二维码加载失败</div>';
+        }
+
+        document.getElementById('xiaomiLoginUrl').value = data.login_url;
+        status.textContent = '';
+        btn.disabled = false; btn.textContent = '获取二维码';
+    } catch (e) {
+        status.textContent = '网络错误: ' + e.message;
+        status.style.color = 'var(--danger)';
+        btn.disabled = false; btn.textContent = '获取二维码';
+        _xiaomiQRActive = false;
+    }
+}
+
+async function xiaomiCompleteQR() {
+    const btn = document.getElementById('xiaomiScanBtn');
+    const status = document.getElementById('xiaomiQRStatus');
+
+    btn.disabled = true; btn.textContent = '等待扫码...';
+    status.textContent = '请用米家 App 扫描二维码登录';
+    status.style.color = 'var(--text-dim)';
+
+    // Poll for completion (background long-poll is already running on server)
+    let attempts = 0;
+    const maxAttempts = 60; // 60 * 3s = 3 minutes
+    while (attempts < maxAttempts) {
+        try {
+            const res = await fetch(`${API}/api/xiaomi/qr/complete`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: _xiaomiSessionId })
+            });
+            const data = await res.json();
+            if (data.ok) {
+                _xiaomiQRActive = false;
+                showDeviceList(data);
+                return;
+            }
+            if (data.error && !data.error.includes('等待扫码')) {
+                // Real error, not just "still waiting"
+                status.textContent = data.error;
+                status.style.color = 'var(--danger)';
+                btn.disabled = false; btn.textContent = '已完成扫码';
+                _xiaomiQRActive = false;
+                return;
+            }
+        } catch (e) {
+            // Network error, retry
+        }
+        attempts++;
+        await new Promise(r => setTimeout(r, 3000));
+    }
+    status.textContent = '等待超时，请重新获取二维码';
+    status.style.color = 'var(--danger)';
+    btn.disabled = false; btn.textContent = '已完成扫码';
+    _xiaomiQRActive = false;
+}
+
+function showDeviceList(data) {
+    document.getElementById('xiaomiLoginForm').style.display = 'none';
+    document.getElementById('xiaomiQRForm').style.display = 'none';
+    document.getElementById('xiaomiDeviceList').style.display = 'block';
+
+    const list = document.getElementById('xiaomiDevices');
+    const devices = data.cuktech && data.cuktech.length > 0 ? data.cuktech : data.devices;
+    if (devices.length === 0) {
+        list.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:16px;">未找到设备</div>';
+    } else {
+        list.innerHTML = devices.map(d =>
+            `<div class="config-row" style="cursor:pointer;border:1px solid var(--card-border);border-radius:8px;padding:10px;margin-bottom:6px;" onclick="selectDevice('${d.did}','${d.mac}','${d.token}')">
+                <div><div class="config-label">${d.name || d.model}</div><div class="config-hint">${d.model} | ${d.mac}</div></div>
+            </div>`
+        ).join('');
+    }
+}
+
+async function selectDevice(did, mac, token) {
+    const status = document.getElementById('xiaomiLoginStatus');
+    status.textContent = '正在获取 BLE Key...';
+    status.style.color = 'var(--text-dim)';
+    document.getElementById('xiaomiDeviceList').style.display = 'none';
+    document.getElementById('xiaomiQRForm').style.display = 'block';
+
+    try {
+        const res = await fetch(`${API}/api/xiaomi/beaconkey`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: _xiaomiSessionId, did })
+        });
+        const data = await res.json();
+        const bleKey = data.ok ? data.ble_key : '';
+
+        document.getElementById('ble_mac').value = mac;
+        document.getElementById('ble_token').value = token;
+        document.getElementById('ble_key').value = bleKey;
+
+        status.textContent = '已获取设备信息，请检查后保存';
+        status.style.color = 'var(--success)';
+        setTimeout(closeXiaomiModal, 1500);
+    } catch (e) {
+        status.textContent = '获取 BLE Key 失败: ' + e.message;
+        status.style.color = 'var(--danger)';
+    }
+}
+</script>
+
+<!-- Xiaomi Cloud Login Modal -->
+<div id="xiaomiModal" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,0.7);align-items:center;justify-content:center;">
+    <div style="background:var(--card-bg);border:1px solid var(--card-border);border-radius:16px;padding:20px;width:90%;max-width:400px;max-height:80vh;overflow-y:auto;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+            <span style="font-size:17px;font-weight:600;color:var(--text);">小米云登录</span>
+            <span onclick="closeXiaomiModal()" style="font-size:20px;cursor:pointer;color:var(--text-dim);padding:4px;">&times;</span>
+        </div>
+
+        <!-- Login Form -->
+        <div id="xiaomiLoginForm">
+            <div style="margin-bottom:12px;">
+                <div class="config-label" style="margin-bottom:4px;">服务器区域</div>
+                <select id="xiaomi_server" class="config-select" style="width:100%;">
+                    <option value="cn" selected>中国大陆 (cn)</option>
+                    <option value="de">欧洲 (de)</option>
+                    <option value="us">美国 (us)</option>
+                    <option value="ru">俄罗斯 (ru)</option>
+                    <option value="tw">台湾 (tw)</option>
+                    <option value="sg">新加坡 (sg)</option>
+                    <option value="in">印度 (in)</option>
+                </select>
+            </div>
+            <button class="btn-save" id="xiaomiLoginBtn" onclick="xiaomiStartQR()" style="margin-top:0;">获取二维码</button>
+            <div id="xiaomiLoginStatus" style="margin-top:8px;font-size:12px;color:var(--text-dim);text-align:center;min-height:18px;"></div>
+        </div>
+
+        <!-- QR Code Display -->
+        <div id="xiaomiQRForm" style="display:none;">
+            <div style="text-align:center;margin-bottom:12px;">
+                <div style="font-size:13px;color:#666;margin-bottom:8px;">使用<strong style="color:#333;">米家 App</strong> 扫描下方二维码</div>
+                <div id="xiaomiQRImg" style="display:inline-block;padding:8px;background:#fff;border-radius:8px;"></div>
+            </div>
+            <div style="margin-bottom:12px;">
+                <div style="font-size:11px;color:#888;margin-bottom:4px;">或复制链接到浏览器打开：</div>
+                <input class="config-input" id="xiaomiLoginUrl" readonly style="width:100%;text-align:left;font-size:11px;word-break:break-all;">
+            </div>
+            <button class="btn-save" id="xiaomiScanBtn" onclick="xiaomiCompleteQR()" style="margin-top:0;">已完成扫码</button>
+            <div id="xiaomiQRStatus" style="margin-top:8px;font-size:12px;color:var(--text-dim);text-align:center;min-height:18px;"></div>
+        </div>
+
+        <!-- Device List -->
+        <div id="xiaomiDeviceList" style="display:none;">
+            <div style="font-size:13px;color:var(--text-dim);margin-bottom:10px;">选择充电器设备：</div>
+            <div id="xiaomiDevices"></div>
+            <div style="margin-top:12px;display:flex;gap:8px;">
+                <button class="btn-save" onclick="closeXiaomiModal()" style="margin-top:0;flex:1;background:rgba(255,255,255,0.06);color:var(--text);">取消</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+</body>
+</html>

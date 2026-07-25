@@ -759,6 +759,9 @@
                 console.warn('SSE disconnected, will auto-reconnect');
                 document.getElementById('statusBadge').className = 'status-badge disconnected';
             };
+            // bfcache: close on leave, reopen on return
+            window.addEventListener('pagehide', () => { if (evtSource) { evtSource.close(); evtSource = null; } });
+            window.addEventListener('pageshow', () => { if (!evtSource) initSSE(); });
             // Chart refresh every 30s (decoupled from status)
             sseChartTimer = setInterval(fetchChartData, 30000);
         }

@@ -224,7 +224,7 @@ class TestBemfaClient:
             # Mock MQTT connect to avoid real connection
             with patch.object(c, "_connect_mqtt"):
                 await c.start()
-                mock_post.assert_called_once()
+                mock_post.assert_called()
         await c.stop()
 
     def test_state_cache_on_successful_command(self, client, callback):

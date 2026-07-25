@@ -32,6 +32,7 @@ INTERVAL_PING_RECEIVE = 20   # detect lost after 20s
 MAX_PING_LOST = 3            # reconnect after 3 consecutive lost
 
 CREATE_TOPIC_URL = "http://api.bemfa.com/api/user/addtopic/"
+DELETE_TOPIC_URL = "http://api.bemfa.com/api/user/deltopic/"
 
 MSG_ON = "on"
 MSG_OFF = "off"
@@ -253,12 +254,22 @@ class BemfaClient:
     # ---- HTTP API ----
 
     async def _register_topics(self):
-        """Register all device topics via HTTP API."""
+        """Delete and re-register all device topics to ensure names are up to date."""
         _LOGGER.info("Bemfa registering %d topics...", len(self._devices))
         async with aiohttp.ClientSession() as session:
             for dev in self._devices.values():
                 try:
-                    async with session.post(
+                    del_resp = await session.post(
+                        DELETE_TOPIC_URL,
+                        data={"uid": self._uid, "topic": dev.topic, "type": 1},
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    )
+                    _LOGGER.info("Bemfa delete %s: HTTP %d %s", dev.topic, del_resp.status, await del_resp.text())
+                except Exception as e:
+                    _LOGGER.warning("Bemfa delete error: %s: %s", dev.topic, e)
+                await asyncio.sleep(0.1)
+                try:
+                    add_resp = await session.post(
                         CREATE_TOPIC_URL,
                         data={
                             "uid": self._uid,
@@ -267,16 +278,12 @@ class BemfaClient:
                             "name": dev.name,
                         },
                         timeout=aiohttp.ClientTimeout(total=5),
-                    ) as resp:
-                        if resp.status == 200:
-                            _LOGGER.info("Bemfa registered: %s (%s)", dev.topic, dev.name)
-                        else:
-                            _LOGGER.warning(
-                                "Bemfa register failed: %s HTTP %d", dev.topic, resp.status
-                            )
+                    )
+                    body = await add_resp.text()
+                    _LOGGER.info("Bemfa add %s (%s): HTTP %d %s", dev.topic, dev.name, add_resp.status, body)
                 except Exception as e:
-                    _LOGGER.warning("Bemfa register error: %s: %s", dev.topic, e)
-                await asyncio.sleep(0.1)  # small delay between requests
+                    _LOGGER.warning("Bemfa add error: %s: %s", dev.topic, e)
+                await asyncio.sleep(0.1)
 
     # ---- Ping/Pong Keepalive (aligned with HA integration) ----
 

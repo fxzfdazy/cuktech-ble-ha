@@ -73,6 +73,11 @@ class ServerConfig:
 class BemfaConfig:
     enabled: bool = False
     uid: str = ""
+    name_c1: str = "C口1开关"
+    name_c2: str = "C口2开关"
+    name_c3: str = "C口3开关"
+    name_a: str = "USB-A开关"
+    name_ble: str = "蓝牙开关"
 
 
 @dataclass
@@ -163,6 +168,11 @@ def load_config() -> Config:
     bemfa = BemfaConfig(
         enabled=bemfa_enabled,
         uid=os.environ.get("BEMFA_UID", bemfa_cfg.get("uid", "")),
+        name_c1=bemfa_cfg.get("name_c1", "C口1开关"),
+        name_c2=bemfa_cfg.get("name_c2", "C口2开关"),
+        name_c3=bemfa_cfg.get("name_c3", "C口3开关"),
+        name_a=bemfa_cfg.get("name_a", "USB-A开关"),
+        name_ble=bemfa_cfg.get("name_ble", "蓝牙开关"),
     )
 
     return Config(ble=ble, mqtt=mqtt, server=server, bemfa=bemfa)

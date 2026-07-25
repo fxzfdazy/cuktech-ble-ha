@@ -645,6 +645,9 @@ function initPhoneSSE() {
     evtSource.onerror = () => {
         document.getElementById('connectDot').style.background = '#666';
     };
+    // bfcache: close on leave, reopen on return
+    window.addEventListener('pagehide', () => { if (evtSource) { evtSource.close(); evtSource = null; } });
+    window.addEventListener('pageshow', () => { if (typeof initPhoneSSE === 'function') initPhoneSSE(); });
 }
 
 function applyFullStatus(data) {

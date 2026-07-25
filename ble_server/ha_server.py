@@ -4,6 +4,7 @@ BLE data is published to MQTT for real-time updates in Home Assistant.
 """
 import asyncio
 import re
+import sys
 import warnings
 warnings.filterwarnings('ignore', message='.*default MTU.*')
 import gzip
@@ -20,6 +21,11 @@ from config import load_config, LOG_LEVELS
 from state import ChargerState, PORT_BITS, PORT_NAMES, PORT_DEFAULT, VALID_PIIDS, PIID_RANGES, PROTOCOL_SWITCH_BITS
 from ble_manager import BLEManager, set_status_cache_invalidator
 from history import PortHistory
+try:
+    from xiaomi_cloud import XiaomiCloudLoginError, QrCodeXiaomiCloudClient
+except ImportError:
+    XiaomiCloudLoginError = Exception
+    QrCodeXiaomiCloudClient = None
 from bemfa_client import BemfaClient, MSG_ON, MSG_OFF
 
 logging.basicConfig(
@@ -84,18 +90,13 @@ class Server:
         self._chart_cache_ttl = 10
         self._chart_cache_max = 50
         self.sse = SSEEmitter()
+        self._xiaomi_sessions = {}  # session_id -> XiaomiCloudClient for 2FA flow
         self.history = PortHistory(
             db_path=self.config.server.history_db_path,
             retention_days=self.config.server.history_retention_days,
         )
         self.bemfa: BemfaClient | None = None
-        log_file = Path(__file__).parent / ".log_level"
-        log_level = self.config.server.log_level
-        if log_file.exists():
-            saved = log_file.read_text().strip()
-            if saved in LOG_LEVELS:
-                log_level = saved
-        logging.getLogger().setLevel(LOG_LEVELS.get(log_level, logging.INFO))
+        logging.getLogger().setLevel(LOG_LEVELS.get(self.config.server.log_level, logging.INFO))
 
     def mqtt_publish(self, topic, payload, retain=False):
         """Publish to all enabled MQTT clients (multiplex)."""
@@ -143,12 +144,12 @@ class Server:
 
         self.bemfa = BemfaClient(self.config.bemfa.uid)
 
-        # Register devices
-        self.bemfa.add_device("cuktech_c1", "C口1开关")
-        self.bemfa.add_device("cuktech_c2", "C口2开关")
-        self.bemfa.add_device("cuktech_c3", "C口3开关")
-        self.bemfa.add_device("cuktech_usb_a", "USB-A开关")
-        self.bemfa.add_device("cuktech_ble", "蓝牙开关")
+        # Register devices with custom display names
+        self.bemfa.add_device("cuktech_c1", self.config.bemfa.name_c1)
+        self.bemfa.add_device("cuktech_c2", self.config.bemfa.name_c2)
+        self.bemfa.add_device("cuktech_c3", self.config.bemfa.name_c3)
+        self.bemfa.add_device("cuktech_usb_a", self.config.bemfa.name_a)
+        self.bemfa.add_device("cuktech_ble", self.config.bemfa.name_ble)
 
         # Register command callbacks
         def _port_cmd(port, on):
@@ -517,8 +518,20 @@ class Server:
             return web.json_response({"ok": False, "error": f"invalid level: {level}"}, status=400)
 
         logging.getLogger().setLevel(LOG_LEVELS[level])
-        log_file = Path(__file__).parent / ".log_level"
-        log_file.write_text(level)
+        # Persist to config.yaml so the change survives restart
+        try:
+            import yaml
+            config_path = Path(__file__).parent / "config.yaml"
+            if config_path.exists():
+                with open(config_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                if "server" not in cfg:
+                    cfg["server"] = {}
+                cfg["server"]["log_level"] = level
+                with open(config_path, "w") as f:
+                    yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+        except Exception:
+            _LOGGER.warning("Failed to persist log level to config.yaml", exc_info=True)
         _LOGGER.info("Log level changed to %s", level)
         return web.json_response({"ok": True, "level": level})
 
@@ -831,6 +844,233 @@ class Server:
             self.sse.remove_client(queue)
         return response
 
+    # ── Configuration API ──
+
+    @staticmethod
+    def _mask(val):
+        """Mask sensitive value: show first 4 + **** + last 4."""
+        if not val or len(val) <= 8:
+            return "****"
+        return val[:4] + "****" + val[-4:]
+
+    async def handle_config_get(self, request):
+        """GET /api/config — return current config with masked sensitive fields."""
+        cfg = self.config
+        return web.json_response({
+            "ok": True,
+            "config": {
+                "ble": {
+                    "mac": cfg.ble.mac,
+                    "token": self._mask(cfg.ble.token),
+                    "ble_key": self._mask(cfg.ble.ble_key),
+                    "scan_timeout": cfg.ble.scan_timeout,
+                },
+                "mqtt": {
+                    "enabled": cfg.mqtt.enabled,
+                    "host": cfg.mqtt.host,
+                    "port": cfg.mqtt.port,
+                    "username": cfg.mqtt.username,
+                    "password": self._mask(cfg.mqtt.password),
+                    "topic_prefix": cfg.mqtt.topic_prefix,
+                },
+                "bemfa": {
+                    "enabled": cfg.bemfa.enabled,
+                    "uid": self._mask(cfg.bemfa.uid),
+                    "name_c1": cfg.bemfa.name_c1,
+                    "name_c2": cfg.bemfa.name_c2,
+                    "name_c3": cfg.bemfa.name_c3,
+                    "name_a": cfg.bemfa.name_a,
+                    "name_ble": cfg.bemfa.name_ble,
+                },
+                "server": {
+                    "port": cfg.server.port,
+                    "log_level": cfg.server.log_level,
+                    "history_retention_days": cfg.server.history_retention_days,
+                },
+            },
+        })
+
+    async def handle_config_save(self, request):
+        """POST /api/config — save config to config.yaml and restart."""
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+        config_data = data.get("config", {})
+        config_path = Path(__file__).parent / "config.yaml"
+
+        try:
+            import yaml
+            # Load existing config to preserve unknown fields
+            existing = {}
+            if config_path.exists():
+                with open(config_path) as f:
+                    existing = yaml.safe_load(f) or {}
+
+            # Merge — skip masked placeholder values (****)
+            SENSITIVE_KEYS = {"token", "ble_key", "password", "uid"}
+            for section in ("ble", "mqtt", "bemfa", "server"):
+                if section in config_data:
+                    if section not in existing:
+                        existing[section] = {}
+                    for k, v in config_data[section].items():
+                        if k in SENSITIVE_KEYS and v and "****" in str(v):
+                            continue  # Skip masked values, keep original
+                        existing[section][k] = v
+
+            with open(config_path, "w") as f:
+                yaml.dump(existing, f, allow_unicode=True, default_flow_style=False)
+
+            _LOGGER.info("Config saved to %s, restarting...", config_path)
+
+            # Schedule restart after response
+            loop = asyncio.get_running_loop()
+            loop.call_later(1.0, lambda: asyncio.ensure_future(self._restart()))
+
+            return web.json_response({"ok": True, "message": "配置已保存，服务将在 1 秒后重启"})
+        except ImportError:
+            return web.json_response({"ok": False, "error": "yaml module not installed"}, status=500)
+        except Exception as e:
+            _LOGGER.error("Config save failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _restart(self):
+        """Gracefully restart the server by re-exec-ing the process."""
+        _LOGGER.info("Restarting server...")
+        s = get_server()
+        try:
+            await asyncio.wait_for(s.ble.request_stop(), timeout=5.0)
+        except Exception:
+            pass
+        if s.mqtt_client:
+            s.mqtt_client.loop_stop()
+            s.mqtt_client.disconnect()
+        if s.bemfa:
+            try:
+                await asyncio.wait_for(s.bemfa.stop(), timeout=3.0)
+            except Exception:
+                pass
+        s.history.close()
+        # Re-exec: replace current process with fresh server
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).parent / "ha_server.py")])
+
+    # ── Xiaomi Cloud API ──
+
+    async def handle_xiaomi_login(self, request):
+        """POST /api/xiaomi/login — start QR code login, return QR URL."""
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+        server = data.get("server", "cn").strip()
+        if server not in ("cn", "de", "us", "ru", "tw", "sg", "in", "i2"):
+            return web.json_response({"ok": False, "error": "无效的服务器区域"}, status=400)
+
+        try:
+            import secrets as _secrets
+            loop = asyncio.get_running_loop()
+
+            def _start():
+                client = QrCodeXiaomiCloudClient(server)
+                return client.start_qr_login(), client
+
+            result, client = await loop.run_in_executor(None, _start)
+            session_id = _secrets.token_hex(16)
+            self._xiaomi_sessions[session_id] = client
+
+            return web.json_response({
+                "ok": True,
+                "qr_image": result["qr_image"],
+                "login_url": result["login_url"],
+                "session_id": session_id,
+            })
+        except XiaomiCloudLoginError as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+        except Exception as e:
+            _LOGGER.error("Xiaomi QR start failed: %s", e)
+            return web.json_response({"ok": False, "error": f"启动失败: {e}"}, status=500)
+
+    async def handle_xiaomi_qr_complete(self, request):
+        """POST /api/xiaomi/qr/complete — long-poll for QR scan, return devices."""
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+        session_id = data.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"ok": False, "error": "缺少 session_id"}, status=400)
+
+        client = self._xiaomi_sessions.get(session_id)
+        if not client:
+            return web.json_response({"ok": False, "error": "会话已过期，请重新获取二维码"}, status=400)
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            def _complete():
+                client.complete_qr_login()
+                return client.get_devices()
+
+            devices = await loop.run_in_executor(None, _complete)
+            # Don't pop session here — beaconkey endpoint still needs it
+
+            cuktech_devices = [d for d in devices if "njcuk" in d.model or "fitting" in d.model]
+            all_devices = [{"did": d.did, "mac": d.mac, "token": d.token,
+                            "name": d.name, "model": d.model} for d in devices]
+
+            return web.json_response({
+                "ok": True,
+                "devices": all_devices,
+                "cuktech": [{"did": d.did, "mac": d.mac, "token": d.token,
+                             "name": d.name, "model": d.model} for d in cuktech_devices],
+            })
+        except XiaomiCloudLoginError as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+        except Exception as e:
+            _LOGGER.error("Xiaomi QR complete failed: %s", e)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def handle_xiaomi_beaconkey(self, request):
+        """POST /api/xiaomi/beaconkey — get BLE key for a device."""
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+        session_id = data.get("session_id", "").strip()
+        did = data.get("did", "").strip()
+
+        if not session_id or not did:
+            return web.json_response({"ok": False, "error": "参数不完整"}, status=400)
+
+        client = self._xiaomi_sessions.get(session_id)
+        if not client:
+            return web.json_response({"ok": False, "error": "会话已过期，请重新扫码"}, status=400)
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            def _get_key():
+                return client.get_beaconkey(did)
+
+            ble_key = await loop.run_in_executor(None, _get_key)
+            # Clean up session after beaconkey is retrieved
+            self._xiaomi_sessions.pop(session_id, None)
+
+            if ble_key:
+                return web.json_response({"ok": True, "ble_key": ble_key})
+            return web.json_response({"ok": False, "error": "未找到 BLE Key"}, status=404)
+        except XiaomiCloudLoginError as e:
+            self._xiaomi_sessions.pop(session_id, None)
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+        except Exception as e:
+            _LOGGER.error("Get beaconkey failed: %s", e)
+            self._xiaomi_sessions.pop(session_id, None)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
 
 WEB_DIR = Path(__file__).parent / "web"
 _server = None
@@ -903,6 +1143,7 @@ async def cache_middleware(request, handler):
 app = web.Application(middlewares=[cors_middleware, gzip_middleware, cache_middleware])
 app.router.add_get("/", lambda r: get_server().handle_index(r))
 app.router.add_get("/phone.html", lambda r: web.FileResponse(WEB_DIR / "phone.html"))
+app.router.add_get("/config.html", lambda r: web.FileResponse(WEB_DIR / "config.html"))
 app.router.add_get("/api/status", lambda r: get_server().handle_status(r))
 app.router.add_post("/api/set", lambda r: get_server().handle_set(r))
 app.router.add_post("/api/port", lambda r: get_server().handle_port(r))
@@ -918,6 +1159,11 @@ app.router.add_get("/api/sessions", lambda r: get_server().handle_sessions(r))
 app.router.add_get("/api/sessions/{id}/points", lambda r: get_server().handle_session_points(r))
 app.router.add_get("/api/energy/stats", lambda r: get_server().handle_energy_stats(r))
 app.router.add_get("/api/events", lambda r: get_server().handle_sse(r))
+app.router.add_get("/api/config", lambda r: get_server().handle_config_get(r))
+app.router.add_post("/api/config", lambda r: get_server().handle_config_save(r))
+app.router.add_post("/api/xiaomi/login", lambda r: get_server().handle_xiaomi_login(r))
+app.router.add_post("/api/xiaomi/qr/complete", lambda r: get_server().handle_xiaomi_qr_complete(r))
+app.router.add_post("/api/xiaomi/beaconkey", lambda r: get_server().handle_xiaomi_beaconkey(r))
 app.router.add_static("/static", WEB_DIR / "static", show_index=False)
 
 

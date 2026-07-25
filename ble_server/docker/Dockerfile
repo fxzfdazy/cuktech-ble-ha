@@ -17,9 +17,12 @@ COPY src/ src/
 RUN pip install --no-cache-dir .
 
 COPY web/ web/
-COPY state.py state_protocol_v2.py history.py config.py ble_manager.py ha_server.py bemfa_client.py energy.py downsample.py ./
+COPY state.py state_protocol_v2.py history.py config.py ble_manager.py ha_server.py bemfa_client.py energy.py downsample.py xiaomi_cloud.py ./
 
 RUN mkdir -p /data
+
+# Copy default config (user can override by mounting their own)
+COPY config.yaml.example ./config.yaml
 
 EXPOSE 8199
 

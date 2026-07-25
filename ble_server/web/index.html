@@ -7,8 +7,8 @@
     <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
     <link rel="preload" href="/static/chart.umd.min.js" as="script">
     <link rel="preload" href="/static/charger.png" as="image">
-    <script src="/static/chart.umd.min.js"></script>
-    <script src="/static/charge_history.js?v=2"></script>
+    <script defer src="/static/chart.umd.min.js"></script>
+    <script defer src="/static/charge_history.js?v=2"></script>
     <script src="/static/chart-loader.js"></script>
     <script src="/static/chart-config.js"></script>
     <link rel="stylesheet" href="static/index.css">
@@ -169,6 +169,8 @@
         <div class="footer">
             <a href="https://github.com/kairui1108/cuktech-ble-server" target="_blank" style="color: var(--accent); text-decoration: none;">CUKTECH-BLE-HA Web</a>
             <span style="margin: 0 12px; color: var(--text-dim);">|</span>
+            <a href="config.html" style="color: var(--text-dim); text-decoration: none; font-size: 13px;">&#9881; 配置</a>
+            <span style="margin: 0 12px; color: var(--text-dim);">|</span>
             <div class="theme-switcher" id="themeSwitcher">
                 <button class="theme-btn" onclick="toggleThemeMenu()" id="themeBtn">🎨 主题</button>
                 <div class="theme-menu" id="themeMenu">
@@ -222,6 +224,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script defer src="/static/app.js"></script>
 </body>
 </html>
