@@ -5,8 +5,11 @@ YAML file takes precedence over environment variables.
 """
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+_LOGGER = logging.getLogger(__name__)
 
 LOG_LEVELS = {
     "debug": logging.DEBUG,
@@ -40,9 +43,9 @@ class BLEConfig:
 
     def __post_init__(self):
         if not self.mac or self.mac == "XX:XX:XX:XX:XX:XX":
-            raise ValueError("CUKTECH_DEVICE_MAC 未配置，请设置环境变量或 config.yaml")
+            _LOGGER.warning("CUKTECH_DEVICE_MAC 未配置，BLE 连接不可用。可通过 config.html 配置或设置环境变量")
         if not self.token:
-            raise ValueError("CUKTECH_DEVICE_TOKEN 未配置，请设置环境变量或 config.yaml")
+            _LOGGER.warning("CUKTECH_DEVICE_TOKEN 未配置，BLE 连接不可用。可通过 config.html 配置或设置环境变量")
 
 
 @dataclass
@@ -59,7 +62,7 @@ class MQTTConfig:
 @dataclass
 class ServerConfig:
     host: str = "0.0.0.0"
-    port: int = 8199
+    port: int = field(default_factory=lambda: 18199 if sys.platform == "win32" else 8199)
     command_timeout: float = 10.0
     settings_refresh_interval: float = 10.0
     log_level: str = "info"
@@ -152,7 +155,7 @@ def load_config() -> Config:
 
     server = ServerConfig(
         host=server_cfg.get("host", "0.0.0.0"),
-        port=int(os.environ.get("CUKTECH_SERVER_PORT", server_cfg.get("port", 8199))),
+        port=int(os.environ.get("CUKTECH_SERVER_PORT", server_cfg.get("port", 18199 if sys.platform == "win32" else 8199))),
         command_timeout=server_cfg.get("command_timeout", 10.0),
         settings_refresh_interval=server_cfg.get("settings_refresh_interval", 60.0),
         log_level=os.environ.get("CUKTECH_LOG_LEVEL", server_cfg.get("log_level", "info")),

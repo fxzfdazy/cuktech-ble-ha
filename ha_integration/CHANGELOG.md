@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.8] - 2026-07-25
+
+### Changed
+- BLE enable/disable: MQTT as primary channel, HTTP as fallback (no more dual write)
+- `time.time()` replaced with `hass.loop.time()` to avoid system clock shift issues
+
+### Fixed
+- reauth flow missing `async_set_unique_id`, preventing proper config entry matching
+- Silent exception in `_async_health_check` JSON parsing now logged as warning
+- Health check HTTP success now updates `_last_status_time` for correct availability
+- `_last_status_time` initialized to negative value for correct startup availability
+
 ## [1.0.7] - 2026-07-22
 
 ### Added

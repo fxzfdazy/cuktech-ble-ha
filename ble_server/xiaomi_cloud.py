@@ -14,7 +14,10 @@ import time
 from typing import Optional
 
 import requests
-from Crypto.Cipher import ARC4
+try:
+    from Crypto.Cipher import ARC4
+except ModuleNotFoundError:
+    from Cryptodome.Cipher import ARC4
 
 _LOGGER = logging.getLogger("xiaomi_cloud")
 

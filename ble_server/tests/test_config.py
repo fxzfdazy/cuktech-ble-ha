@@ -21,24 +21,21 @@ class TestBLEConfig:
 
     @patch.dict(os.environ, {"CUKTECH_DEVICE_MAC": ""})
     def test_missing_mac_raises(self):
-        """Test that missing MAC raises ValueError."""
-        import pytest
-        with pytest.raises(ValueError, match="CUKTECH_DEVICE_MAC"):
-            BLEConfig(mac="", token="aabbccddeeff")
+        """Test that missing MAC does not crash (graceful warning)."""
+        cfg = BLEConfig(mac="", token="aabbccddeeff")
+        assert cfg.mac == ""
 
     @patch.dict(os.environ, {"CUKTECH_DEVICE_MAC": "XX:XX:XX:XX:XX:XX"})
     def test_placeholder_mac_raises(self):
-        """Test that placeholder MAC raises ValueError."""
-        import pytest
-        with pytest.raises(ValueError, match="CUKTECH_DEVICE_MAC"):
-            BLEConfig(mac="XX:XX:XX:XX:XX:XX", token="aabbccddeeff")
+        """Test that placeholder MAC does not crash (graceful warning)."""
+        cfg = BLEConfig(mac="XX:XX:XX:XX:XX:XX", token="aabbccddeeff")
+        assert cfg.mac == "XX:XX:XX:XX:XX:XX"
 
     @patch.dict(os.environ, {"CUKTECH_DEVICE_TOKEN": ""})
     def test_missing_token_raises(self):
-        """Test that missing token raises ValueError."""
-        import pytest
-        with pytest.raises(ValueError, match="CUKTECH_DEVICE_TOKEN"):
-            BLEConfig(mac="AA:BB:CC:DD:EE:FF", token="")
+        """Test that missing token does not crash (graceful warning)."""
+        cfg = BLEConfig(mac="AA:BB:CC:DD:EE:FF", token="")
+        assert cfg.token == ""
 
 
 class TestMQTTConfig:

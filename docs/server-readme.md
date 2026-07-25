@@ -1,7 +1,5 @@
 # CUKTECH 10 GaN Charger Ultra - BLE Server
 
-> **[English](README.en.md)**
-
 独立的 BLE 服务器，用于连接 CUKTECH 充电器并通过 MQTT 推送实时数据到 Home Assistant。
 
 ## 功能特性
@@ -13,12 +11,15 @@
 - **协议检测**：自动识别 PD / PD Fixed / PD PPS / QC / USB-A 充电协议
 - **协议开关控制**：通过 API 独立控制各端口 PD/PPS/UFCS/SCP 协议开关
 - **Web 管理界面**：实时功率曲线图、端口控制、协议控制、设备设置、巴法云启停，支持 6 种主题
+- **Web 配置页面**：通过 `config.html` 在线修改配置，支持小米云扫码自动获取设备信息
 - **HTTP API**：提供 RESTful 接口供外部系统调用
 - **MQTT LWT**：崩溃时自动通知 HA 设备离线
 - **巴法云 (Bemfa) 接入**：支持小爱同学/小度音箱语音控制充电器端口
 - **充电记录与电量统计**：自动记录充电会话（起止时间、电量、峰值功率），Web UI 查看历史详情
 - **电量积分 (Wh)**：基于梯形积分实时累积端口充电能量
 - **SQLite 历史数据**：端口数据持久化存储，支持统计和导出
+- **BLE 连接质量评估**：实时评分（0-100），包含解密率、通知响应、连接稳定性等指标
+- **充电完成通知**：通过 MQTT 推送充电完成事件，支持 HA 自动化
 - **环境检查**：`check_env.sh` 一键检查系统兼容性
 
 ## 系统要求
@@ -33,37 +34,103 @@
 - BlueZ 5.66+（推荐 5.71）
 - MQTT Broker（如 EMQX、Mosquitto）
 
-## Docker 部署
+## 快速开始（推荐）
 
-### 拉取镜像直接运行（推荐）
+### 方式一：Web 配置页面（最简单）
+
+首次配置无需手动编辑配置文件：
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/kairui1108/cuktech-ble-ha.git
+cd cuktech-ble-ha/ble_server
+
+# 2. 安装依赖
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+
+# 3. 复制配置模板
+cp config.yaml.example config.yaml
+
+# 4. 启动服务
+./cuktech_ctl.sh start
+
+# 5. 打开浏览器访问 Web 配置页面
+#    http://<服务器IP>:8199/config.html
+
+# 6. 在配置页面中：
+#    a. 点击「小米云自动获取」→ 用米家 App 扫码 → 自动填充 MAC/Token/BLE Key
+#    b. 填写 MQTT 配置（如需接入 Home Assistant）
+#    c. 填写巴法云 UID（如需接入小爱同学）
+#    d. 点击「保存配置并重启」
+```
+
+**配置页面功能：**
+- 小米云 QR 码扫码登录，自动获取设备 MAC、Token、BLE Key
+- BLE / MQTT / 巴法云 / 服务器参数在线修改
+- 巴法云设备显示名称自定义
+- 敏感信息（Token、BLE Key、密码）自动脱敏显示
+- 保存后自动重启服务
+
+### 方式二：手动配置
+
+```bash
+# 1. 获取设备 Token
+# 使用 Xiaomi-cloud-tokens-extractor 或 Web 配置页面获取
+pip install xiaomi_cloud_tokens_extractor
+python -m xiaomi_cloud_tokens_extractor
+
+# 2. 复制配置模板并填入设备信息
+cp config.yaml.example config.yaml
+vim config.yaml
+
+# 3. 启动服务
+./cuktech_ctl.sh start
+```
+
+### 方式三：Docker 部署
+
+镜像内置默认 `config.yaml`（来自 `config.yaml.example`），可通过环境变量或挂载卷覆盖配置。
+
+#### 使用默认配置启动（推荐）：
+
+```bash
+docker run -d \
+  --name cuktech-ble \
+  --network host \
+  --privileged \
+  --restart unless-stopped \
+  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
+  -v $(pwd)/data:/data \
+  -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
+  ghcr.io/kairui1108/cuktech-ble-server:latest
+# 然后访问 http://<服务器IP>:8199/config.html 通过 Web 页面配置
+```
+
+#### 拉取镜像直接运行
 
 ```bash
 # 1. 创建配置文件
 cat > config.yaml << EOF
 ble:
   mac: "XX:XX:XX:XX:XX:XX"
-  token: "your_token_12bytes_hex"
-  ble_key: "your_ble_key_16bytes_hex"
+  token: "your_token_hex"
+  ble_key: "your_ble_key_hex"
 mqtt:
-  # 设置为 true 启用 MQTT（用于 Home Assistant 集成），false 则作为独立 web 服务运行
   enabled: true
   host: ""
   port: 1883
   username: ""
   password: ""
-  keepalive: 60
   topic_prefix: "cuktech/charger"
-
 server:
-  host: "0.0.0.0"
   port: 8199
-  command_timeout: 10.0
-  reconnect_base_delay: 1.0
-  reconnect_max_delay: 300.0
-  settings_refresh_interval: 60.0
+  settings_refresh_interval: 10.0
   log_level: "error"
-  history_retention_days: 2
-  history_db_path: ""
+bemfa:
+  enabled: false
+  uid: ""
 EOF
 
 # 2. 运行容器
@@ -78,140 +145,64 @@ docker run -d \
   -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
   ghcr.io/kairui1108/cuktech-ble-server:latest
 
-# 3. 查看日志
-docker logs -f cuktech-ble
+# 3. 通过 Web 配置页面完善配置
+#    http://<服务器IP>:8199/config.html
 ```
 
-### 环境变量配置
-
-```bash
-docker run -d \
-  --name cuktech-ble \
-  --network host \
-  --privileged \
-  --restart unless-stopped \
-  -v $(pwd)/data:/data \
-  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
-  -e CUKTECH_DEVICE_MAC="xx:xx:xx:xx:xx:xx" \
-  -e CUKTECH_DEVICE_TOKEN="your_token_12bytes_hex" \
-  -e CUKTECH_DEVICE_BLE_KEY="your_ble_key_16bytes_hex" \
-  -e MQTT_ENABLED="false" \
-  -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
-  ghcr.io/kairui1108/cuktech-ble-server:latest
-```
-
-### Docker Compose 拉取运行（推荐）
+#### Docker Compose
 
 ```bash
 git clone https://github.com/kairui1108/cuktech-ble-ha.git
 cd cuktech-ble-ha
-
-# 编辑配置，填入你的设备信息
-vim ble_server/docker/docker-compose.pull.yml
-
-# 直接拉取镜像并启动（无需本地构建）
+vim ble_server/docker/docker-compose.pull.yml  # 编辑配置
 docker compose -f ble_server/docker/docker-compose.pull.yml up -d
 ```
 
-### 本地构建
+## Web 管理界面
 
-```bash
-cd ble_server
-# 使用配置文件的方式运行，编辑 config.yaml 填入你的设备信息
-cp config.yaml.example config.yaml
-docker compose -f docker/docker-compose.yml up -d
+| 页面 | 地址 | 说明 |
+|------|------|------|
+| 主控台 | `http://<IP>:8199/` | 实时功率、端口控制、协议控制、设备设置 |
+| 手机版 | `http://<IP>:8199/phone.html` | 移动端适配 |
+| 配置页面 | `http://<IP>:8199/config.html` | 修改配置、小米云扫码获取设备信息 |
+| 端口监控 | `http://<IP>:8199/static/port_monitor.html` | 四端口独立监控 |
+| 倒计时 | `http://<IP>:8199/static/countdown.html` | 倒计时快速设置 |
+| 设备信息 | `http://<IP>:8199/static/device_info.html` | 设备详情与 BLE 控制 |
 
-# 使用环境变量的方式运行，修改 docker-compose.env.yml 填入你的设备信息
-docker compose -f docker/docker-compose.env.yml up -d
-```
+### 配置页面使用指南
 
-### 蓝牙说明
+1. **首次配置**：打开 `/config.html`，点击「小米云自动获取」，用米家 App 扫码，自动获取设备信息
+2. **修改配置**：直接在页面修改参数，点击「保存配置并重启」
+3. **MQTT 配置**：填入 Broker 地址、端口、用户名密码，启用后接入 Home Assistant
+4. **巴法云配置**：填入私钥，可自定义各端口设备显示名称
+5. **敏感信息**：Token、BLE Key、密码等自动脱敏显示，修改时输入新值即可覆盖
 
-- 容器使用 `--network host` 共享主机网络
-- 通过挂载 `/var/run/dbus/system_bus_socket` 使用主机 BlueZ 蓝牙栈
-- `--privileged` 提供蓝牙硬件访问权限
-- 主机上其他蓝牙应用不受影响
+### BLE 连接质量
 
-## 传统部署
+悬浮 BLE 徽章可查看连接质量评分（0-100），包含：
+- 解密成功率、通知响应性、连接稳定性、5 分钟内重连次数
+- 连接时长、最后推送时间、下次重连延迟
+- MQTT 和巴法云连接状态
 
-### 1. 获取设备 Token
+## HTTP API
 
-使用 [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor) 从米家云端获取：
-
-```bash
-pip install xiaomi_cloud_tokens_extractor
-python -m xiaomi_cloud_tokens_extractor
-```
-
-选择你的 CUKTECH 充电器，获取：
-- `MAC` - 设备蓝牙 MAC 地址（如 `3C:CD:73:34:AE:59`）
-- `Token` - 设备 Token（12 字节 hex）
-- `BLE Key` - BLE 认证密钥（16 字节 hex）
-
-### 2. 检查环境
-
-```bash
-./check_env.sh
-```
-
-确认 Python、蓝牙适配器、BLE 支持等全部通过。
-
-### 3. 安装
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-### 4. 配置
-
-复制 `config.yaml.example` 为 `config.yaml` 并填入你的配置：
-
-```yaml
-ble:
-  mac: "3C:CD:73:34:AE:59"
-  token: "your_token_here"
-  ble_key: "your_ble_key_here"
-
-mqtt:
-  host: "192.168.1.63"
-  port: 1883
-  username: "admin"
-  password: "your_password"
-  keepalive: 60
-  topic_prefix: "cuktech/charger"
-
-server:
-  # 设置为 true 启用 MQTT（用于 Home Assistant 集成），false 则作为独立 web 服务运行
-  # 也可以通过环境变量 MQTT_ENABLED=1 启用
-  enabled: true
-  host: "0.0.0.0"
-  port: 8199
-  command_timeout: 10.0
-  reconnect_base_delay: 1.0
-  reconnect_max_delay: 300.0
-  settings_refresh_interval: 60.0
-```
-
-也可通过环境变量配置（优先级高于 config.yaml）：
-
-```bash
-export CUKTECH_DEVICE_MAC="3C:CD:73:34:AE:59"
-export CUKTECH_DEVICE_TOKEN="your_token"
-export CUKTECH_DEVICE_BLE_KEY="your_ble_key"
-export MQTT_HOST="192.168.1.63"
-export MQTT_PORT="1883"
-export MQTT_USER="admin"
-export MQTT_PASS="your_password"
-export MQTT_ENABLED=1
-```
-
-### 5. 启动
-
-```bash
-./cuktech_ctl.sh start
-```
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/events` | GET | SSE 事件流（端口数据、状态、设置、质量实时推送） |
+| `/api/status` | GET | 获取充电器完整状态 |
+| `/api/enable` | POST | 启用/禁用 BLE 连接 |
+| `/api/set` | POST | 设置 PIID 值 |
+| `/api/port` | POST | 控制端口开关 |
+| `/api/protocol` | POST | 控制协议开关 |
+| `/api/config` | GET/POST | 读取/保存配置 |
+| `/api/xiaomi/login` | POST | 小米云 QR 码登录 |
+| `/api/xiaomi/qr/complete` | POST | 完成 QR 码登录 |
+| `/api/xiaomi/beaconkey` | POST | 获取 BLE Key |
+| `/api/log-level` | GET/POST | 日志级别管理 |
+| `/api/bemfa` | GET | 巴法云状态查询 |
+| `/api/chart` | GET | 图表数据 |
+| `/api/sessions` | GET | 充电记录 |
+| `/api/energy/stats` | GET | 能量统计 |
 
 ## 服务管理
 
@@ -220,115 +211,22 @@ export MQTT_ENABLED=1
 ./cuktech_ctl.sh stop          # 停止
 ./cuktech_ctl.sh restart       # 重启
 ./cuktech_ctl.sh status        # 查看状态
-./cuktech_ctl.sh log [n]       # 查看最后 n 行日志（默认 50）
+./cuktech_ctl.sh log [n]       # 查看日志
 ./cuktech_ctl.sh clear-log     # 清空日志
 ./cuktech_ctl.sh clear-history # 清空历史数据库
 ```
 
-### 开机自启
-
-**方式 A：systemd（推荐）**
-
-```bash
-cd systemd && ./install-service.sh
-```
-
-**方式 B：crontab**
-
-```bash
-@reboot /path/to/cuktech_ctl.sh start
-```
-
-## Web 管理界面
-
-访问 `http://<服务器IP>:8199/`
-
-### 功能
-
-- **SSE 实时推送**：端口数据、状态变更通过 SSE 事件流即时更新，Web 界面无需轮询
-- **设备信息**：连接状态、BLE 控制、总功率、最高电压
-- **功率曲线**：Chart.js 实时折线图，显示各端口及总功率趋势
-- **端口监控**：C1/C2/C3/A 四端口独立控制，显示电压、电流、功率、协议
-- **设备设置**：场景模式、息屏时间、语言等下拉框控制
-- **倒计时设置**：快速按钮 + 自定义分钟输入
-- **日志级别管理**：运行时切换 debug/info/warning/error
-
-### 主题
-
-支持 6 种主题切换：暗色、深蓝、海洋、灰色、浅色、跟随系统
-
-## MQTT Topics
-
-| Topic | 方向 | 说明 |
-|-------|------|------|
-| `cuktech/charger/port/c1` | 发布 | C1 端口数据（JSON, retain） |
-| `cuktech/charger/port/c2` | 发布 | C2 端口数据（JSON, retain） |
-| `cuktech/charger/port/c3` | 发布 | C3 端口数据（JSON, retain） |
-| `cuktech/charger/port/a` | 发布 | A 端口数据（JSON, retain） |
-| `cuktech/charger/settings` | 发布 | 设备设置（retain） |
-| `cuktech/charger/status` | 发布 | 连接状态（retain + LWT） |
-| `cuktech/charger/set` | 订阅 | 设置命令 |
-| `cuktech/charger/port` | 订阅 | 端口控制命令 |
-
-## HTTP API
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/api/events` | GET | SSE 事件流（端口数据、状态、设置实时推送） |
-| `/api/status` | GET | 获取充电器完整状态 |
-| `/api/enable` | POST | 启用/禁用 BLE 连接 `{"enabled": true/false}` |
-| `/api/set` | POST | 设置 PIID 值 `{"piid": N, "value": V}` |
-| `/api/port` | POST | 控制端口开关 `{"port": "c1", "action": "on/off"}` |
-| `/api/protocol` | POST | 控制协议开关 `{"port": "c1", "protocol": "pd"}` |
-| `/api/chart` | GET | 获取图表数据 |
-| `/api/history/{port}` | GET | 查询历史数据 |
-| `/api/statistics/{port}` | GET | 统计分析 |
-| `/api/export/{port}` | GET | CSV 导出 |
-| `/api/log-level` | GET/POST | 日志级别管理 |
-| `/api/bemfa` | GET/POST | 巴法云状态查询与启停控制 |
-
-## 架构
-
-```
-CUKTECH 充电器 ←BLE→ BLE Server ←MQTT→ Home Assistant
-                         ↓
-                    Web UI / HTTP API
-```
-
-BLE Server 作为独立进程运行，通过 BLE 连接充电器获取数据，经 MQTT 推送到 Home Assistant。Web UI 和 HTTP API 由同一进程提供服务。
-
-## 已知限制
-
-- **单设备**：当前架构仅支持同时连接一个充电器，多设备支持将在后续版本更新
-- **充电协议检测**：硬件协议码（PIID 17/18）与米家 App 一致，刷新间隔约 60 秒，期间切换协议可能滞后显示；无硬件码时降级为启发式推断
-- **平台支持**：开发与测试均基于 Linux 环境，其他平台（macOS、Windows）的稳定性未经验证，使用风险自行承担
-
-## 协议支持
-
-| 协议 | 说明 |
-|------|------|
-| 5V | USB 5V |
-| PD | USB Power Delivery |
-| PPS | PD 可编程电源 |
-| QC | Quick Charge |
-| AFC | Samsung Adaptive Fast Charging |
-| FCP | Huawei Fast Charge Protocol |
-| SCP | Huawei Super Charge Protocol |
-| UFCS | Universal Fast Charging Specification |
-| idle | 无设备连接 |
-
 ## 测试
 
 ```bash
-# 135 个测试
-.venv/bin/python -m pytest tests/ -v
+.venv/bin/python -m pytest tests/ -v  # 240+ tests
 ```
 
 ## 致谢
 
-- [cuktech-ble-controller](https://github.com/zhyzhaogit/cuktech-ble-controller) - BLE 协议参考实现
+- [cuktech-ble-controller](https://github.com/zhyzhaogit/cuktech-ble-controller) - BLE 协议参考
 - [ha-cuk-ble](https://github.com/zuyan9/ha-cuk-ble) - 协议检测参考
-- [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor) - 小米设备 Token 提取工具
+- [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor) - 小米设备 Token 提取
 - [bleak](https://github.com/hbldh/bleak) - BLE 通信库
 - [paho-mqtt](https://eclipse.dev/paho/) - MQTT 客户端
 

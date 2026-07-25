@@ -58,6 +58,8 @@
 - BLE 连接/断开控制
 - 设备设置管理
 - 倒计时设置（支持自定义和快捷选择）
+- **Web 配置页面**：在线修改配置，小米云扫码自动获取设备信息，敏感信息脱敏
+- **BLE 连接质量**：悬浮查看连接评分、解密率、连接时长、重连次数等指标
 - 日志级别管理
 
 ### 已知限制
@@ -109,7 +111,7 @@ cuktech-ble-ha/
 │   │   ├── phone.html             # 移动端 Web 界面
 │   │   └── static/                # 前端资源 (JS/CSS/图片)
 │   ├── docker/                    # Docker 部署文件
-│   ├── tests/                     # 单元测试 (135 tests)
+│   ├── tests/                     # 单元测试 (240+ tests)
 │   └── systemd/                   # systemd 服务配置
 │
 ├── ha_integration/                # HA 自定义集成
@@ -153,7 +155,24 @@ cuktech-ble-ha/
 
 Docker 部署无需安装 Python 依赖，只需确保宿主机已安装 Docker 和蓝牙适配器。
 
-**拉取镜像直接运行：**
+镜像内置默认 `config.yaml`（来自 `config.yaml.example`），可通过环境变量或挂载卷覆盖配置。
+
+**快速体验（无需配置文件）：**
+
+```bash
+docker run -d \
+  --name cuktech-ble \
+  --network host \
+  --privileged \
+  --restart unless-stopped \
+  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
+  -v $(pwd)/data:/data \
+  -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
+  ghcr.io/kairui1108/cuktech-ble-server:latest
+# 然后访问 http://<服务器IP>:8199/config.html 通过 Web 页面配置
+```
+
+**使用配置文件启动：**
 
 ```bash
 # 创建配置文件
@@ -178,7 +197,7 @@ server:
   command_timeout: 10.0
   reconnect_base_delay: 1.0
   reconnect_max_delay: 300.0
-  settings_refresh_interval: 60.0
+  settings_refresh_interval: 10.0
   log_level: "error"
   history_retention_days: 2
   history_db_path: ""
@@ -196,6 +215,7 @@ docker run -d \
   -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
   -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
   ghcr.io/kairui1108/cuktech-ble-server:latest
+# 首次启动访问 http://<server-ip>:8199/config.html 配置设备信息
 
 # 查看日志
 docker logs -f cuktech-ble
@@ -226,6 +246,12 @@ docker compose -f docker/docker-compose.env.yml up -d
 ## 安装步骤
 
 ### 1. 获取设备 Token 和 BLE Key
+
+**方式一：Web 配置页面（推荐，最简单）**
+
+启动服务后访问 `http://<服务器IP>:8199/config.html`，点击「小米云自动获取」用米家 App 扫码即可自动获取。
+
+**方式二：命令行工具**
 
 使用 [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor) 从米家云端获取设备信息：
 
@@ -258,16 +284,20 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-#### 配置方式（二选一）
+#### 配置方式（三选一）
 
-**方式 A：YAML 配置文件（推荐）**
+**方式 A：Web 配置页面（推荐）**
+
+启动服务后访问 `http://<服务器IP>:8199/config.html`，在线修改所有配置，支持小米云扫码获取设备信息。
+
+**方式 B：YAML 配置文件**
 
 ```bash
 cp config.yaml.example config.yaml
 # 编辑 config.yaml 填入你的配置
 ```
 
-**方式 B：环境变量**
+**方式 C：环境变量**
 
 ```bash
 export CUKTECH_DEVICE_MAC="XX:XX:XX:XX:XX:XX"
@@ -351,6 +381,7 @@ cp -r ha_integration/custom_components/cuktech_charger /config/custom_components
 - aiohttp >= 3.9
 - cryptography >= 41
 - pyyaml >= 6.0
+- requests >= 2.31
 
 ### HA Integration
 - Home Assistant 2024.1+
@@ -359,7 +390,7 @@ cp -r ha_integration/custom_components/cuktech_charger /config/custom_components
 ## 测试
 
 ```bash
-# BLE Server (135 tests)
+# BLE Server (240+ tests)
 cd ble_server && .venv/bin/python -m pytest tests/
 
 # HA Integration (87 tests)

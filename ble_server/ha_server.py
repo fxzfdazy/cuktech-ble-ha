@@ -1228,8 +1228,9 @@ if __name__ == "__main__":
     async def _on_startup(app_):
         # Register SIGTERM handler inside event loop for safe asyncio calls
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: asyncio.ensure_future(app.shutdown()))
+        if sys.platform != "win32":
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, lambda: asyncio.ensure_future(app.shutdown()))
 
     app.on_startup.append(_on_startup)
     web.run_app(app, host="0.0.0.0", port=s.config.server.port)

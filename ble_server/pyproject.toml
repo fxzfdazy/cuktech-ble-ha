@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cuktech-ble-server"
-version = "1.0.7"
+version = "1.0.8"
 description = "CUKTECH 10 GaN Charger BLE Server for Home Assistant"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +13,8 @@ dependencies = [
     "bleak>=0.21",
     "cryptography>=41",
     "pyyaml>=6.0",
+    "requests>=2.31",
+    "pycryptodomex>=3.20",
 ]
 
 [tool.setuptools.packages.find]

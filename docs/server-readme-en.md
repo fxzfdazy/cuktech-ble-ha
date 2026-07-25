@@ -12,12 +12,14 @@ Standalone BLE server for connecting CUKTECH chargers and pushing real-time data
 - **SSE Event Stream**: Server-Sent Events push real-time port updates, status changes, and setting changes — replaces 2s polling
 - **Protocol Detection**: Auto-detect PD / PD Fixed / PD PPS / QC / USB-A
 - **Web UI**: Real-time charts, port control, settings, Bemfa toggle, 6 themes
+- **Web Config Page**: Online configuration via `config.html`, Xiaomi Cloud QR login for auto device setup
 - **HTTP API**: RESTful endpoints for external systems
 - **MQTT LWT**: Auto-notify HA on crash
 - **Bemfa Cloud**: XiaoAi / DuerOS voice control for charger ports
 - **Charge Sessions & Energy Stats**: Auto-record charge sessions (duration, energy Wh, peak power), view history via Web UI
 - **Energy Integration (Wh)**: Real-time trapezoidal energy accumulation per port
 - **SQLite History**: Persistent port data with statistics and CSV export
+- **BLE Connection Quality**: Real-time scoring (0-100) with decrypt rate, notification response, stability metrics
 - **Environment Check**: `check_env.sh` for system compatibility
 
 ## Requirements
@@ -32,9 +34,53 @@ Standalone BLE server for connecting CUKTECH chargers and pushing real-time data
 - BlueZ 5.66+ (5.71 recommended)
 - MQTT Broker (EMQX, Mosquitto, etc.)
 
-## Docker (Recommended)
+## Quick Start
 
-### Pull and run
+### Option A: Web Config Page (Easiest)
+
+no manual config file editing needed:
+
+```bash
+git clone https://github.com/kairui1108/cuktech-ble-ha.git
+cd cuktech-ble-ha/ble_server
+python3 -m venv .venv && source .venv/bin/activate && pip install -e .
+cp config.yaml.example config.yaml
+./cuktech_ctl.sh start
+```
+
+Then open `http://<server-ip>:8199/config.html`:
+1. Click "Get QR Code" → scan with Mi Home app → auto-fill MAC/Token/BLE Key
+2. Fill in MQTT settings (for Home Assistant)
+3. Click "Save & Restart"
+
+### Option B: Docker
+
+```bash
+docker run -d \
+  --name cuktech-ble --network host --privileged --restart unless-stopped \
+  -v $(pwd)/config.yaml:/app/config.yaml:ro \
+  -v $(pwd)/data:/data \
+  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
+  -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
+  ghcr.io/kairui1108/cuktech-ble-server:latest
+# Then open http://<server-ip>:8199/config.html to complete setup
+```
+
+Image ships with a default `config.yaml` (from `config.yaml.example`). You can override settings via volume mount or environment variables.
+
+#### Run with default config (quick try):
+
+```bash
+docker run -d \
+  --name cuktech-ble --network host --privileged --restart unless-stopped \
+  -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro \
+  -v $(pwd)/data:/data \
+  -e CUKTECH_HISTORY_DB_PATH=/data/port_history.db \
+  ghcr.io/kairui1108/cuktech-ble-server:latest
+# Then open http://<server-ip>:8199/config.html to configure via web UI
+```
+
+#### Run with mounted config:
 
 ```bash
 # 1. Create config file
@@ -44,7 +90,6 @@ ble:
   token: "your_token_12bytes_hex"
   ble_key: "your_ble_key_16bytes_hex"
 mqtt:
-  # Set to true to enable MQTT (for Home Assistant integration), false to run as standalone web server
   enabled: true
   host: ""
   port: 1883
@@ -59,10 +104,19 @@ server:
   command_timeout: 10.0
   reconnect_base_delay: 1.0
   reconnect_max_delay: 300.0
-  settings_refresh_interval: 60.0
+  settings_refresh_interval: 10.0
   log_level: "error"
   history_retention_days: 2
   history_db_path: ""
+
+bemfa:
+  enabled: false
+  uid: ""
+  name_c1: "C口1开关"
+  name_c2: "C口2开关"
+  name_c3: "C口3开关"
+  name_a: "USB-A开关"
+  name_ble: "蓝牙开关"
 EOF
 
 # 2. Run container
@@ -117,6 +171,12 @@ docker compose -f docker/docker-compose.env.yml up -d
 
 ### 1. Get Device Token
 
+**Option A: Web Config Page (Recommended)**
+
+After starting the server, open `http://<server-ip>:8199/config.html` and use the Xiaomi Cloud QR login to auto-fetch MAC, Token, and BLE Key.
+
+**Option B: Manual**
+
 ```bash
 pip install xiaomi_cloud_tokens_extractor
 python -m xiaomi_cloud_tokens_extractor
@@ -163,13 +223,17 @@ cp config.yaml.example config.yaml
 
 ## Web UI
 
-Access at `http://<SERVER_IP>:8199/`
+| Page | URL | Description |
+|------|-----|-------------|
+| Dashboard | `http://<IP>:8199/` | Real-time power, port control, protocol control |
+| Mobile | `http://<IP>:8199/phone.html` | Mobile-optimized view |
+| Config | `http://<IP>:8199/config.html` | Online config, Xiaomi Cloud QR login |
 
-- **SSE real-time push**: Port data and status updates delivered via SSE event stream — no polling needed
+- **SSE real-time push**: Port data, status, quality scores delivered via SSE event stream
 - Real-time power charts (Chart.js)
 - Port control (C1/C2/C3/A)
-- Device settings
-- Log level management
+- BLE connection quality metrics (hover BLE badge)
+- Bemfa custom device names
 - 6 theme options
 
 ## MQTT Topics
@@ -186,22 +250,26 @@ Access at `http://<SERVER_IP>:8199/`
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/events` | GET | SSE event stream (port data, status, settings) |
+| `/api/events` | GET | SSE event stream (port data, status, settings, quality) |
 | `/api/status` | GET | Full charger status |
 | `/api/enable` | POST | Enable/disable BLE `{"enabled": true/false}` |
 | `/api/set` | POST | Set PIID value `{"piid": N, "value": V}` |
 | `/api/port` | POST | Control port `{"port": "c1", "action": "on/off"}` |
-| `/api/chart` | GET | Chart data |
-| `/api/history/{port}` | GET | History data |
-| `/api/statistics/{port}` | GET | Statistics |
-| `/api/export/{port}` | GET | CSV export |
+| `/api/protocol` | POST | Control protocol switches |
+| `/api/config` | GET/POST | Read/save configuration |
+| `/api/xiaomi/login` | POST | Xiaomi Cloud QR login |
+| `/api/xiaomi/qr/complete` | POST | Complete QR login |
+| `/api/xiaomi/beaconkey` | POST | Get BLE Key |
 | `/api/log-level` | GET/POST | Log level management |
-| `/api/bemfa` | GET/POST | Bemfa status & toggle control |
+| `/api/bemfa` | GET | Bemfa status |
+| `/api/chart` | GET | Chart data |
+| `/api/sessions` | GET | Charge sessions |
+| `/api/energy/stats` | GET | Energy statistics |
 
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -v
+.venv/bin/python -m pytest tests/ -v  # 240+ tests
 ```
 
 ## Known Limitations
