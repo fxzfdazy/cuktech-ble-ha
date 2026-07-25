@@ -1,7 +1,6 @@
 """Tests for HA Integration MQTT Coordinator."""
 import sys
 import json
-import time
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -65,21 +64,21 @@ class TestCuktechMQTTCoordinator:
     def test_update_availability_mqtt(self, coordinator):
         """Test availability update with MQTT connected."""
         coordinator._mqtt_connected = True
-        coordinator._last_status_time = time.time()
+        coordinator._last_status_time = 980
         coordinator._update_availability()
         assert coordinator.available is True
 
     def test_update_availability_http_recent(self, coordinator):
         """Test availability update with recent HTTP check."""
         coordinator._mqtt_connected = False
-        coordinator._last_status_time = time.time()
+        coordinator._last_status_time = 980
         coordinator._update_availability()
         assert coordinator.available is True
 
     def test_update_availability_stale(self, coordinator):
         """Test availability update with stale HTTP check."""
         coordinator._mqtt_connected = False
-        coordinator._last_status_time = time.time() - 60
+        coordinator._last_status_time = 900
         coordinator._update_availability()
         assert coordinator.available is False
 
@@ -114,7 +113,7 @@ class TestCuktechMQTTCoordinator:
         """Test health failures counter reset on MQTT reconnect."""
         coordinator._health_failures = 5
         coordinator._mqtt_connected = False
-        coordinator._last_status_time = time.time() - 60
+        coordinator._last_status_time = 900
 
         # Simulate MQTT reconnect
         msg = MagicMock()

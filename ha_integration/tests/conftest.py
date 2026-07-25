@@ -122,6 +122,9 @@ def mock_hass():
     hass = MagicMock()
     hass.data = {}
     hass.async_add_executor_job = MagicMock()
+    loop = MagicMock()
+    loop.time.return_value = 1000.0
+    hass.loop = loop
     return hass
 
 
