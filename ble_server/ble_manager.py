@@ -188,8 +188,14 @@ class BLEManager:
         es.last_end_time = timestamp
         if sid and self._history:
             duration = int(timestamp - (es.session_start or timestamp))
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                _LOGGER.warning("_close_session: no event loop, skip DB write for session %d", sid)
+                return sid
+
             if es.session_wh < 0.05:
-                task = asyncio.get_running_loop().run_in_executor(
+                task = loop.run_in_executor(
                     None, self._history.delete_session, sid)
             else:
                 # Publish charge completion event via MQTT
@@ -204,7 +210,7 @@ class BLEManager:
                     "peak_power_w": round(es.max_power, 2),
                     "duration_sec": duration,
                 })
-                task = asyncio.get_running_loop().run_in_executor(
+                task = loop.run_in_executor(
                     None, self._history.end_session, sid,
                     round(es.session_wh, 4), round(es.max_power, 2),
                     round(voltage, 2), round(current, 2), duration)

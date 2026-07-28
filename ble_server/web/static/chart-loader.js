@@ -3,6 +3,12 @@
 if (typeof Chart === 'undefined') {
     var localScript = document.querySelector('script[src="/static/chart.umd.min.js"]');
     if (localScript) {
+        localScript.onload = function() {
+            window._chartLoaded = true;
+            if (typeof window.onChartReady === 'function') {
+                window.onChartReady();
+            }
+        };
         localScript.onerror = function() {
             console.warn('Local Chart.js failed, loading from CDN...');
             var s = document.createElement('script');

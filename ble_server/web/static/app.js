@@ -199,15 +199,24 @@
                 }
             });
         }
-
+        let _chartDataLoaded = false;
         async function fetchChartData() {
             try {
                 const interval = getInterval();
-                const res = await fetch(`${API_BASE}/api/chart?hours=${getCurrentHours()}&interval=${interval}`);
-                if (res.status === 304) return;
+                const url = `${API_BASE}/api/chart?hours=${getCurrentHours()}&interval=${interval}`;
+                const res = await fetch(url);
+                if (res.status === 304) {
+                    if (!_chartDataLoaded) {
+                        // Force fetch on first load (bypass cache)
+                        const r2 = await fetch(url + '&_=' + Date.now());
+                        if (r2.ok) { const j2 = await r2.json(); if (j2.ok) updateChart(j2); }
+                        _chartDataLoaded = true;
+                    }
+                    return;
+                }
                 if (!res.ok) return;
                 const result = await res.json();
-                if (result.ok) updateChart(result);
+                if (result.ok) { updateChart(result); _chartDataLoaded = true; }
             } catch (e) {
                 console.error('Failed to fetch chart data:', e);
             }

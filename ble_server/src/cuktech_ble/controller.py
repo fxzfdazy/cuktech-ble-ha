@@ -72,7 +72,19 @@ class CuktechBLEController:
         queue = self._notify_queues[name]
 
         def handler(sender, data):
-            queue.put_nowait(data)
+            try:
+                queue.put_nowait(data)
+            except asyncio.QueueFull:
+                # 队列积压 — 丢弃最旧帧, 保留最新
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(data)
+                except asyncio.QueueFull:
+                    pass  # 仍放不进就放弃
+                _LOGGER.warning("Notify queue %s overflow, discarded oldest frame", name)
 
         return handler
 
