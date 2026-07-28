@@ -43,7 +43,7 @@ static int _disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error
                          const struct ble_gatt_chr *chr, void *arg);
 
 #define NOTIF_ITEM_SIZE  256
-#define NOTIF_QUEUE_LEN  8
+#define NOTIF_QUEUE_LEN  16
 
 typedef struct { uint8_t data[NOTIF_ITEM_SIZE]; size_t len; uint16_t conn_handle, attr_handle; } NotifItem;
 typedef struct { float voltage, current, power; uint8_t protocol, status; bool active; } PortData;
@@ -158,7 +158,6 @@ static void _pending_match(const uint8_t *resp, size_t rl) {
 static void _nimble_on_sync(void) {
     ESP_LOGI(TAG, "NimBLE host synced");
     ble_hs_util_ensure_addr(0);
-    vTaskDelay(pdMS_TO_TICKS(500));
     _nimble_ready = true;
     ESP_LOGI(TAG, "NimBLE ready");
 }
@@ -300,7 +299,29 @@ static uint8_t _estimate_pd_subtype(float voltage) {
     return 7;
 }
 
-static uint8_t _estimate_proto(uint8_t piid, float voltage, uint8_t code) {
+/* Get hardware protocol code from PIID 17/18 settings.
+   Port mapping (aligned with Python ble_manager.py):
+     PIID 17: byte[3] = C1 hw_proto, byte[1] = C2 hw_proto
+     PIID 18: byte[3] = C3 hw_proto, byte[1] = A  hw_proto */
+static uint8_t _get_hw_proto(uint8_t piid) {
+    switch (piid) {
+        case 1: return (_settings_valid[17] && ((_settings[17] >> 24) & 0xFF) > 0)
+                       ? (_settings[17] >> 24) & 0xFF : 0;
+        case 2: return (_settings_valid[17] && ((_settings[17] >> 8) & 0xFF) > 0)
+                       ? (_settings[17] >> 8) & 0xFF : 0;
+        case 3: return (_settings_valid[18] && ((_settings[18] >> 24) & 0xFF) > 0)
+                       ? (_settings[18] >> 24) & 0xFF : 0;
+        case 4: return (_settings_valid[18] && ((_settings[18] >> 8) & 0xFF) > 0)
+                       ? (_settings[18] >> 8) & 0xFF : 0;
+        default: return 0;
+    }
+}
+
+static uint8_t _estimate_proto(uint8_t piid, float voltage, uint8_t code, uint8_t hw_protocol) {
+    /* Hardware protocol code (from PIID 17/18) takes priority over heuristic.
+       This aligns with Python state_protocol_v2.py which returns hw_protocol
+       immediately if non-zero, bypassing all voltage/code inference. */
+    if (hw_protocol > 0) return hw_protocol;
     if (piid == 1 || piid == 2) {
         // PD 关闭时端口只能输出 5V (对齐 Python state_protocol_v2.py)
         int pd_bit = (piid == 1) ? 0 : 8;
@@ -338,7 +359,7 @@ static void _parse_port(uint8_t piid, const uint8_t *pt, size_t pt_len) {
     uint8_t idx = piid - 1;
     _ports[idx].voltage = ((val >> 24) & 0xFF) / 10.0f;
     _ports[idx].current = ((val >> 16) & 0xFF) / 10.0f;
-    _ports[idx].protocol = _estimate_proto(piid, _ports[idx].voltage, (val >> 8) & 0xFF);
+    _ports[idx].protocol = _estimate_proto(piid, _ports[idx].voltage, (val >> 8) & 0xFF, _get_hw_proto(piid));
     _ports[idx].status = val & 0xFF;
     _ports[idx].power = _ports[idx].voltage * _ports[idx].current;
     _ports[idx].active = (_ports[idx].status != 0) || (_ports[idx].voltage > 0.5f);

@@ -12,13 +12,14 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
 
 #include "config.h"
 #include "config_store.h"
 #include "http_server.h"
-#include "ota_update.h"
 #include "bemfa.h"
 
 #if ENABLE_MQTT
@@ -128,7 +129,11 @@ static uint8_t _pd_subtype(float voltage) {
 }
 
 static uint8_t estimate_protocol(uint8_t piid, float voltage, uint8_t code,
-                                  uint32_t caps, bool pd_enabled) {
+                                  uint32_t caps, bool pd_enabled, uint8_t hw_protocol) {
+    /* Hardware protocol code (from PIID 17/18) takes priority.
+       Aligned with Python state_protocol_v2.py which returns hw_protocol
+       immediately when non-zero, bypassing all heuristic inference. */
+    if (hw_protocol > 0) return hw_protocol;
     if (piid == 1 || piid == 2) {
         int idx = piid - 1;
         if (!pd_enabled && voltage > 0) return 1;
@@ -511,58 +516,77 @@ static void mqtt_init(void) {}
 // ============================================================
 
 static EventGroupHandle_t wifi_event_group = NULL;
-static int wifi_retry_count = 0;
-#define WIFI_CONNECTED_BIT BIT0
+// ============================================================
+// System Manager — event-driven startup state machine
+// ============================================================
 
+static int wifi_retry_count = 0;
+#define SYS_EVT_WIFI_READY   BIT0
+#define SYS_EVT_BLE_READY    BIT1
+
+static EventGroupHandle_t sys_events;  // system-level event flags
+
+/* Stages of the system startup lifecycle */
+enum sys_stage {
+    STAGE_IDLE,
+    STAGE_WIFI,
+    STAGE_HTTP,
+    STAGE_BLE,
+    STAGE_MQTT,
+    STAGE_RUNNING,
+};
+static enum sys_stage _stage = STAGE_IDLE;
+
+static const char *stage_name(enum sys_stage s) {
+    switch (s) {
+        case STAGE_IDLE:    return "IDLE";
+        case STAGE_WIFI:    return "WIFI";
+        case STAGE_HTTP:    return "HTTP";
+        case STAGE_BLE:     return "BLE";
+        case STAGE_MQTT:    return "MQTT";
+        case STAGE_RUNNING: return "RUNNING";
+        default:            return "?";
+    }
+}
+
+static void advance_stage(void) {
+    ESP_LOGI(TAG, "=== Stage: %s → %s ===",
+             stage_name(_stage), stage_name(_stage + 1));
+    _stage++;
+}
+
+/* WiFi Manager — pure event passing, no blocking in callbacks */
 static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (wifi_retry_count < 100) wifi_retry_count++;
-        int delay_ms = (wifi_retry_count < 5) ? (1000 * (1 << wifi_retry_count)) : 30000;
-        ESP_LOGW(TAG, "WiFi disconnected, retry in %dms (attempt %d)", delay_ms, wifi_retry_count);
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
-        esp_wifi_connect();
+        wifi_retry_count++;
+        ESP_LOGW(TAG, "WiFi disconnected (reason=%d), retry (attempt %d)",
+                 ((wifi_event_sta_disconnected_t*)data)->reason, wifi_retry_count);
+        xEventGroupClearBits(sys_events, SYS_EVT_WIFI_READY);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         wifi_retry_count = 0;
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)data;
         ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        xEventGroupSetBits(sys_events, SYS_EVT_WIFI_READY);
     }
 }
 
-static void wifi_init(void) {
-    wifi_event_group = xEventGroupCreate();
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t any_id;
-    esp_event_handler_instance_t got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                    &wifi_event_handler, NULL, &any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                    &wifi_event_handler, NULL, &got_ip));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = "",
-            .password = "",
-        },
-    };
-    strncpy((char*)wifi_config.sta.ssid, g_cfg.wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char*)wifi_config.sta.password, g_cfg.wifi_pass, sizeof(wifi_config.sta.password) - 1);
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi connecting to %s...", g_cfg.wifi_ssid);
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
-                         pdMS_TO_TICKS(20000));
+/* Dedicated reconnect task — never blocks the Event Loop */
+static void wifi_reconnect_task(void *arg) {
+    while (1) {
+        /* Wait for disconnect with both bits cleared */
+        xEventGroupWaitBits(sys_events, SYS_EVT_WIFI_READY,
+                            pdFALSE, pdFALSE, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(100));  /* debounce */
+        /* WIFI_READY is clear → we are disconnected → reconnect */
+        if (!(xEventGroupGetBits(sys_events) & SYS_EVT_WIFI_READY)) {
+            int d = (wifi_retry_count < 5) ? (1000 * (1 << wifi_retry_count)) : 30000;
+            if (d > 30000) d = 30000;
+            vTaskDelay(pdMS_TO_TICKS(d));
+            esp_wifi_connect();
+        }
+    }
 }
 
 // ============================================================
@@ -585,6 +609,8 @@ static void on_ble_state_change(BLEState old_state, BLEState new_state) {
 
 static void ble_task(void *pvParameters) {
     ESP_LOGI(TAG, "BLE task started");
+    /* Extra delay to let WiFi fully stabilize before BLE radio activity */
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     ble_manager_set_state_callback(on_ble_state_change);
     ble_manager_set_port_data_callback(NULL);
@@ -697,6 +723,7 @@ static void ble_task(void *pvParameters) {
 
 static void app_task(void* pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(100));
+    uint64_t last_mem_print = 0;
     uint64_t last_status_print = 0;
     uint64_t last_cd_fetch = 0;
     uint64_t last_mqtt_restart = 0;
@@ -704,6 +731,14 @@ static void app_task(void* pvParameters) {
 
     while (1) {
         uint64_t now = esp_timer_get_time() / 1000;
+
+        // Memory monitor every 10 seconds
+        if (now - last_mem_print >= 10000) {
+            last_mem_print = now;
+            ESP_LOGI(TAG, "MEM: free=%u min=%u",
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)esp_get_minimum_free_heap_size());
+        }
 
 #if ENABLE_MQTT
         // MQTT health check with exponential backoff
@@ -755,7 +790,17 @@ static void app_task(void* pvParameters) {
                         int bit = (idx == 0) ? 0 : 8;
                         pd_on = (protocol_extend_val >> bit) & 1;
                     }
-                    uint8_t proto = estimate_protocol(res.piid, v, code, 0, pd_on);
+                    // Extract hardware protocol code from PIID 17/18 if available
+                    uint8_t hw_proto = 0;
+                    if (settings_valid[17] || settings_valid[18]) {
+                        switch (res.piid) {
+                            case 1: if (settings_valid[17]) hw_proto = (settings[17] >> 24) & 0xFF; break;
+                            case 2: if (settings_valid[17]) hw_proto = (settings[17] >> 8) & 0xFF; break;
+                            case 3: if (settings_valid[18]) hw_proto = (settings[18] >> 24) & 0xFF; break;
+                            case 4: if (settings_valid[18]) hw_proto = (settings[18] >> 8) & 0xFF; break;
+                        }
+                    }
+                    uint8_t proto = estimate_protocol(res.piid, v, code, 0, pd_on, hw_proto);
                     bool was_active = port_data[idx].active;
                     // Debounce: skip zero-value GET if port was previously active
                     // and we're within 2s of a non-port-control SET (protocol transitions).
@@ -832,11 +877,12 @@ static void app_task(void* pvParameters) {
                 // Always update Bemfa BLE state regardless of main MQTT
                 bemfa_publish_status(res.value != 0);
                 if (res.value) {
-                    // BLE connected — fetch key settings from device
-                    // Only GET essential PIIDs to avoid 120s+ blocking
-                    static const uint8_t READABLE_PIIDS[] = {6, 16, 21};
-                    for (int i = 0; i < sizeof(READABLE_PIIDS); i++) {
-                        BleCommand c = {CMD_GET, READABLE_PIIDS[i], 0, 0};
+                    // Fetch settings on initial BLE connect so frontend shows
+                    // actual values instead of hardcoded defaults, and protocol
+                    // detection uses real hardware protocol codes (PIID 17/18).
+                    static const uint8_t INIT_PIIDS[] = {5, 6, 15, 21, 17, 18};
+                    for (int i = 0; i < sizeof(INIT_PIIDS); i++) {
+                        BleCommand c = {CMD_GET, INIT_PIIDS[i], 0, 0};
                         xQueueSend(cmd_queue, &c, 0);
                     }
                 }
@@ -846,10 +892,12 @@ static void app_task(void* pvParameters) {
             }
         }
 
-        // Periodically GET countdown values (PIID 9-12) + port control (PIID 16)
+        // Periodically GET port data (PIID 1-4), scene mode (PIID 5),
+        // screen time (PIID 6), trickle (PIID 15), protocol switches (PIID 21),
+        // countdown values (PIID 9-12), and port control (PIID 16)
         if (ble_ready_flag && (now - last_cd_fetch >= 30000)) {
             last_cd_fetch = now;
-            static const uint8_t CD_PIIDS[] = {9, 10, 11, 12, 16};
+            static const uint8_t CD_PIIDS[] = {1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 15, 16, 21};
             for (int i = 0; i < sizeof(CD_PIIDS); i++) {
                 BleCommand c = {CMD_GET, CD_PIIDS[i], 0, 0};
                 xQueueSend(cmd_queue, &c, 0);
@@ -886,13 +934,15 @@ static void ap_reboot_callback(void) {
     xTaskCreate(_reboot_task, "reboot", 2048, NULL, 1, NULL);
 }
 
-static void enter_ap_mode(void) {
+static void enter_ap_mode(bool net_init_done) {
     ESP_LOGW(TAG, "No config found — entering AP mode for setup");
     ESP_LOGW(TAG, "Connect to WiFi: %s  Password: %s", AP_SSID, AP_PASSWORD);
     ESP_LOGW(TAG, "Then open: http://192.168.4.1/");
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    if (!net_init_done) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+    }
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -921,6 +971,88 @@ static void enter_ap_mode(void) {
 }
 
 // ============================================================
+// System Manager — startup coordinator
+// ============================================================
+
+static void system_manager(void) {
+    sys_events = xEventGroupCreate();
+
+    /* ---- Stage: WiFi ---- */
+    advance_stage(); // STAGE_WIFI
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+
+    esp_event_handler_instance_t e_any, e_gotip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                    &wifi_event_handler, NULL, &e_any));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                    &wifi_event_handler, NULL, &e_gotip));
+
+    wifi_config_t wifi_sta = {
+        .sta = {.ssid = "", .password = ""},
+    };
+    strncpy((char*)wifi_sta.sta.ssid, g_cfg.wifi_ssid, sizeof(wifi_sta.sta.ssid)-1);
+    strncpy((char*)wifi_sta.sta.password, g_cfg.wifi_pass, sizeof(wifi_sta.sta.password)-1);
+    ESP_LOGI(TAG, "WiFi SSID='%s' (len=%d) PASS len=%d",
+             g_cfg.wifi_ssid, strlen(g_cfg.wifi_ssid), strlen(g_cfg.wifi_pass));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    /* Coexistence: balance BLE and WiFi */
+    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi connecting to %s...", g_cfg.wifi_ssid);
+    EventBits_t bits = xEventGroupWaitBits(sys_events, SYS_EVT_WIFI_READY,
+                                            pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
+    if (!(bits & SYS_EVT_WIFI_READY)) {
+        ESP_LOGW(TAG, "WiFi failed to connect within 30s — proceeding in AP mode");
+        enter_ap_mode(true);  // netif/event_loop already initialized
+        return;
+    }
+    /* Start reconnect task only AFTER first successful connection */
+    xTaskCreatePinnedToCore(wifi_reconnect_task, "wifi_reconn", 3072, NULL, 3, NULL, 0);
+
+    /* ---- Stage: HTTP ---- */
+    advance_stage(); // STAGE_HTTP
+    _init_topics();
+    _init_settings_defaults();
+    ble_manager_store_setting(16, port_ctrl_val);
+    ble_manager_store_setting(21, protocol_extend_val);
+
+    cmd_queue = xQueueCreate(20, sizeof(BleCommand));
+    urgent_queue = xQueueCreate(4, sizeof(BleCommand));
+    result_queue = xQueueCreate(32, sizeof(BleResult));
+    state_mutex = xSemaphoreCreateMutex();
+
+    http_server_set_callbacks(get_port_data_json, get_settings_json,
+                              handle_port_control, handle_setting_set,
+                              handle_protocol_toggle,
+                              handle_ble_control);
+    http_server_start(&g_cfg, ap_reboot_callback);
+    ESP_LOGI(TAG, "HTTP server ready");
+
+    /* ---- Stage: BLE ---- */
+    advance_stage(); // STAGE_BLE
+    xTaskCreatePinnedToCore(ble_task, "ble", 16384, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(app_task,  "app", 8192,  NULL, 1, NULL, 0);
+
+    /* ---- Stage: MQTT + Bemfa ---- */
+    advance_stage(); // STAGE_MQTT
+    vTaskDelay(pdMS_TO_TICKS(2000));  // brief settle before MQTT dials out
+    mqtt_init();
+    bemfa_init(&g_cfg, handle_port_control, handle_ble_control);
+
+    advance_stage(); // STAGE_RUNNING
+    ESP_LOGI(TAG, "System startup complete — all services running");
+}
+
+// ============================================================
 // app_main
 // ============================================================
 
@@ -931,55 +1063,12 @@ void app_main(void) {
 
     // NVS init
     config_store_init();
-
-    // Load config from NVS
     config_store_load(&g_cfg);
 
-    // First-time setup: no saved config → AP mode
     if (!g_cfg.valid) {
-        enter_ap_mode();
-        return; // never reached
+        enter_ap_mode(false);  // first boot — init netif/event_loop
+        return;
     }
 
-    // WiFi
-    wifi_init();
-    _init_topics();
-    _init_settings_defaults();
-    // Sync PIID 16/21 to ble_manager for protocol detection
-    ble_manager_store_setting(16, port_ctrl_val);
-    ble_manager_store_setting(21, protocol_extend_val);
-
-    // OTA
-    ota_update_init();
-
-    // HTTP server (for config, OTA & dashboard)
-    http_server_set_callbacks(get_port_data_json, get_settings_json,
-                              handle_port_control, handle_setting_set,
-                              handle_protocol_toggle,
-                              handle_ble_control);
-    http_server_start(&g_cfg, ap_reboot_callback);
-    ESP_LOGI(TAG, "HTTP server ready");
-
-    // MQTT
-    mqtt_init();
-
-    // Create queues
-    cmd_queue = xQueueCreate(20, sizeof(BleCommand));
-    urgent_queue = xQueueCreate(4, sizeof(BleCommand));
-    result_queue = xQueueCreate(32, sizeof(BleResult));
-    state_mutex = xSemaphoreCreateMutex();
-
-    // Bemfa (小爱同学) — after queues and MQTT are ready
-    bemfa_init(&g_cfg, handle_port_control, handle_ble_control);
-
-    // Start tasks
-    // C3 is single-core, use un-pinned tasks.
-    // ESP32 / S3: pin BLE to core 1, app to core 0 for better cache isolation.
-#if CONFIG_IDF_TARGET_ESP32C3
-    xTaskCreate(ble_task, "ble", 16384, NULL, 2, NULL);
-    xTaskCreate(app_task,  "app", 8192,  NULL, 1, NULL);
-#else
-    xTaskCreatePinnedToCore(ble_task, "ble", 16384, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(app_task,  "app", 8192,  NULL, 1, NULL, 0);
-#endif
+    system_manager();
 }
