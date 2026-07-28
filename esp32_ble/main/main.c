@@ -29,6 +29,7 @@
 
 #include "queue_msg.h"
 #include "ble_manager.h"
+#include "miot_protocol_shared.h"
 
 static const char* TAG = "MAIN";
 static DeviceConfig g_cfg;
@@ -103,97 +104,28 @@ static const char* get_proto_name(uint8_t code) {
     return (code < PROTO_NAMES_LEN) ? PROTO_NAMES[code] : "?";
 }
 
-static const float PD_FIXED_VOLTAGES[] = {5.0, 9.0, 12.0, 15.0, 20.0};
-
-// Extract PDO kind for a port from settings[17/18]
-// kind==0x07 = PD Fixed, kind==0x08 = PD PPS
-static int _get_pdo_kind(int idx) {
-    uint32_t pdo_word = (idx < 2) ? settings[17] : settings[18];
-    uint16_t port_val = (idx % 2 == 0) ? (pdo_word & 0xFFFF) : (pdo_word >> 16);
-    return (port_val >> 8) & 0xFF; // high byte = kind
-}
-
-static float _min_dist_to_pd(float voltage) {
-    float d = fabsf(voltage - PD_FIXED_VOLTAGES[0]);
-    for (int i = 1; i < 5; i++) {
-        float nd = fabsf(voltage - PD_FIXED_VOLTAGES[i]);
-        if (nd < d) d = nd;
-    }
-    return d;
-}
-
-// PD vs PPS subtype estimation — matches Python _estimate_pd_subtype
-static uint8_t _pd_subtype(float voltage) {
-    float md = _min_dist_to_pd(voltage);
-    if (voltage < 12.0f) {
-        if (md <= 0.05f) return 7;   // PD (exact match to PD fixed standard)
-        return 8;                     // PPS
-    }
-    if (md <= 0.3f) return 7;        // PD
-    if (voltage >= 3.0f && voltage <= 21.0f) return 8;  // PPS
-    return 7;
-}
-
 static uint8_t estimate_protocol(uint8_t piid, float voltage, uint8_t code,
                                   uint32_t caps, bool pd_enabled, uint8_t hw_protocol) {
-    /* Hardware protocol code (from PIID 17/18) takes priority.
-       Aligned with Python state_protocol_v2.py which returns hw_protocol
-       immediately when non-zero, bypassing all heuristic inference. */
+    /* Hardware protocol code (from PIID 17/18) takes priority. */
     if (hw_protocol > 0) return hw_protocol;
-    if (piid == 1 || piid == 2) {
-        int idx = piid - 1;
-        if (!pd_enabled && voltage > 0) return 1;
-        if (code == 0x08) return 8;
-        if (code == 0x70) {
-            // Python: score > 0.9 → min_dist < 0.05V → PD; else QC
-            if (_min_dist_to_pd(voltage) <= 0.05f) return 7;
-            return 3;
+
+    int idx = piid - 1;
+    bool pps_enabled = false;
+    uint8_t pdo_kind = 0;
+    if (idx == 0 || idx == 1) {
+        int pps_bit = (idx == 0) ? 1 : 9;
+        pps_enabled = (protocol_extend_val >> pps_bit) & 1;
+        if (settings_valid[17]) {
+            uint16_t port_word = (idx == 0) ? (settings[17] & 0xFFFF) : ((settings[17] >> 16) & 0xFFFF);
+            pdo_kind = (port_word >> 8) & 0xFF;
         }
-        if (code == 0x01 || code == 0x03 || code == 0x04 || code == 0x05 ||
-            code == 0x06 || code == 0x07 || code == 0x0A || code == 0x0B || code == 0x30) {
-            int pps_bit = (idx == 0) ? 1 : 9;
-            bool pps_enabled = (protocol_extend_val >> pps_bit) & 1;
-            int pdo_kind = settings_valid[17] ? _get_pdo_kind(idx) : 0;
-            if (pdo_kind == 0x08) {  // PDO PPS
-                if (!pps_enabled) return 7;  // PPS switched off → PD
-                float md = _min_dist_to_pd(voltage);
-                if (md <= 0.05f) return 7;   // exact PD fixed match
-                return 8;                     // PPS
-            } else if (pdo_kind == 0x07) {    // PDO PD Fixed
-                if (pps_enabled && voltage < 12.0f)
-                    return _pd_subtype(voltage);  // may be PPS if no exact match
-                return 7;                          // PD
-            }
-            // No PDO data
-            if (!pps_enabled) return 7;      // PPS off → PD
-            return _pd_subtype(voltage);      // voltage-based
+    } else if (piid == 3) {
+        if (settings_valid[18]) {
+            pdo_kind = ((settings[18] & 0xFFFF) >> 8) & 0xFF;
         }
-        // Other codes — voltage fallback (matches Python loose match + PPS range)
-        float md = _min_dist_to_pd(voltage);
-        if (md <= 0.5f) return 7;
-        if (voltage >= 3.0f && voltage <= 21.0f) return 8;
-        return 0;
     }
-    if (piid == 3) {
-        if (code == 0x70) {
-            // Python: check PDO first — if PD Fixed/PPS, return 7; else QC
-            if (settings_valid[18]) {
-                int pdo_kind = _get_pdo_kind(2);  // idx=2 for C3
-                if (pdo_kind == 0x07 || pdo_kind == 0x08) return 7;
-            }
-            return 3;
-        }
-        if (voltage >= 15.0) return 7;
-        if (voltage >= 8.5) return 3;
-        if (voltage <= 5.5) return 1;
-        return voltage > 6.0 ? 3 : 1;
-    }
-    if (piid == 4) {
-        if (code == 0x70) return 3;
-        if (voltage > 5.5) return 3;
-        if (voltage > 0) return 1;
-    }
-    return 0;
+
+    return estimate_protocol_shared(piid, voltage, code, pd_enabled, pps_enabled, pdo_kind, hw_protocol);
 }
 
 // ============================================================
@@ -757,45 +689,40 @@ static void app_task(void* pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(100));
     uint64_t last_mem_print = 0;
     uint64_t last_status_print = 0;
-    uint64_t last_cd_fetch = 0;
+    uint64_t last_cd_fetch_slow = 0;
+    uint64_t last_cd_fetch_fast = 0;
     uint64_t last_mqtt_restart = 0;
     int mqtt_restart_count = 0;
 
     while (1) {
         uint64_t now = esp_timer_get_time() / 1000;
 
-        // Memory monitor every 10 seconds
+        // Memory monitor + GC every 10 seconds
         if (now - last_mem_print >= 10000) {
             last_mem_print = now;
-            ESP_LOGI(TAG, "MEM: free=%u min=%u",
-                     (unsigned)esp_get_free_heap_size(),
-                     (unsigned)esp_get_minimum_free_heap_size());
-        }
-
-#if ENABLE_MQTT
-        // MQTT health check with exponential backoff
-        if (last_mqtt_ok == 0) {
-            last_mqtt_ok = now;
-        }
-        if (now - last_mqtt_ok > 60000) {
-            uint32_t interval = (mqtt_restart_count < 3) ? 180 : (mqtt_restart_count < 6) ? 300 : 600;
-            if (now - last_mqtt_restart >= interval) {
-                /* Skip restart if heap is too fragmented to create the MQTT task */
-                if (esp_get_free_heap_size() < 8192) {
-                    ESP_LOGW(TAG, "MQTT restart skipped — free heap %lu < 8KB", (unsigned long)esp_get_free_heap_size());
-                } else {
-                    ESP_LOGW(TAG, "MQTT no activity %lus, restarting (attempt %d)...",
-                             (unsigned long)(now - last_mqtt_ok) / 1000, mqtt_restart_count + 1);
-                    esp_mqtt_client_stop(mqtt_client);
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    esp_mqtt_client_start(mqtt_client);
-                    last_mqtt_restart = now;
-                    mqtt_restart_count++;
-                }
+            size_t _free = esp_get_free_heap_size();
+            size_t _largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            ESP_LOGI(TAG, "MEM: free=%u min=%u max_block=%u",
+                     (unsigned)_free,
+                     (unsigned)esp_get_minimum_free_heap_size(),
+                     (unsigned)_largest);
+            if (_largest < _free / 2) {
+                ESP_LOGW(TAG, "Fragmentation: max_block=%u < free/2 (%u) — triggering GC",
+                         (unsigned)_largest, (unsigned)_free / 2);
+                /* Active GC: reset cJSON pool, log detailed caps breakdown */
+                size_t pool_peak = http_server_pool_gc();
+                multi_heap_info_t info;
+                heap_caps_get_info(&info, MALLOC_CAP_8BIT);
+                ESP_LOGI(TAG, "GC: pool_peak=%u caps_8bit: free=%u min_free=%u largest=%u total_alloc=%u",
+                         (unsigned)pool_peak,
+                         (unsigned)info.total_free_bytes,
+                         (unsigned)info.minimum_free_bytes,
+                         (unsigned)info.largest_free_block,
+                         (unsigned)info.total_allocated_bytes);
             }
         }
-        if (now - last_mqtt_ok < 60000) mqtt_restart_count = 0;
-#endif
+
+
 
         // Process BLE results
         BleResult res;
@@ -933,14 +860,21 @@ static void app_task(void* pvParameters) {
             }
         }
 
-        // Periodically GET scene mode (PIID 5), screen time (PIID 6),
-        // trickle (PIID 15), protocol switches (PIID 21),
-        // countdown values (PIID 9-12), and port control (PIID 16)
-        if (ble_ready_flag && (now - last_cd_fetch >= 30000)) {
-            last_cd_fetch = now;
-            static const uint8_t CD_PIIDS[] = {5, 6, 9, 10, 11, 12, 15, 16, 21};
-            for (int i = 0; i < sizeof(CD_PIIDS); i++) {
-                BleCommand c = {CMD_GET, CD_PIIDS[i], 0, 0};
+        // Slow poll (90s): scene mode, screen time, countdown, trickle
+        if (ble_ready_flag && (now - last_cd_fetch_slow >= 90000)) {
+            last_cd_fetch_slow = now;
+            static const uint8_t SLOW_PIIDS[] = {5, 6, 9, 10, 11, 12, 15};
+            for (int i = 0; i < sizeof(SLOW_PIIDS); i++) {
+                BleCommand c = {CMD_GET, SLOW_PIIDS[i], 0, 0};
+                xQueueSend(cmd_queue, &c, 0);
+            }
+        }
+        // Fast poll (20s): port control (16) and protocol extends (21) change via SET
+        if (ble_ready_flag && (now - last_cd_fetch_fast >= 20000)) {
+            last_cd_fetch_fast = now;
+            static const uint8_t FAST_PIIDS[] = {16, 21};
+            for (int i = 0; i < sizeof(FAST_PIIDS); i++) {
+                BleCommand c = {CMD_GET, FAST_PIIDS[i], 0, 0};
                 xQueueSend(cmd_queue, &c, 0);
             }
         }
@@ -1086,7 +1020,7 @@ static void system_manager(void) {
 
     /* ---- Stage: BLE ---- */
     advance_stage(); // STAGE_BLE
-    xTaskCreatePinnedToCore(ble_task, "ble", 10240, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(ble_task, "ble", 16384, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(app_task,  "app", 8192,  NULL, 1, NULL, 0);
 
     /* ---- Stage: MQTT + Bemfa ---- */

@@ -3,6 +3,7 @@
 #include "miot_protocol.h"
 #include "miot_auth.h"
 #include "queue_msg.h"
+#include "miot_protocol_shared.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -42,8 +43,9 @@ static int _disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error
 static int _disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                          const struct ble_gatt_chr *chr, void *arg);
 
-#define NOTIF_ITEM_SIZE  64
-#define NOTIF_QUEUE_LEN  16
+#define NOTIF_ITEM_SIZE  256
+#define NOTIF_QUEUE_LEN  8
+#define NOTIF_QUEUE_LEN_AUTH  2  // auth queues only used briefly during startup
 
 typedef struct { uint8_t data[NOTIF_ITEM_SIZE]; size_t len; uint16_t conn_handle, attr_handle; } NotifItem;
 typedef struct { float voltage, current, power; uint8_t protocol, status; bool active; } PortData;
@@ -77,7 +79,7 @@ static int _char_ctx_n = 0;
 /* ============================================================
  * Async pending command table
  * ============================================================ */
-#define MAX_PENDING 8
+#define MAX_PENDING 12
 #define CIPHER_BUF_SIZE 128
 
 typedef enum { PENDING_GET, PENDING_SET } PendingType;
@@ -283,26 +285,8 @@ static bool _wru(uint16_t handle, const uint8_t *data, size_t len) {
 /* ============================================================
  * Port data parsing + protocol estimation
  * ============================================================ */
-static const float _PD_FV[] = {5.0f, 9.0f, 12.0f, 15.0f, 20.0f};
-
-static float _min_dist(float voltage) {
-    float d = fabsf(voltage - _PD_FV[0]);
-    for (int i = 1; i < 5; i++) { float nd = fabsf(voltage - _PD_FV[i]); if (nd < d) d = nd; }
-    return d;
-}
-
-static uint8_t _estimate_pd_subtype(float voltage) {
-    float md = _min_dist(voltage);
-    if (voltage < 12.0f) { if (md <= 0.05f) return 7; return 8; }
-    if (md <= 0.3f) return 7;
-    if (voltage >= 3.0f && voltage <= 21.0f) return 8;
-    return 7;
-}
-
-/* Get hardware protocol code from PIID 17/18 settings.
-   Port mapping (aligned with Python ble_manager.py):
-     PIID 17: byte[3] = C1 hw_proto, byte[1] = C2 hw_proto
-     PIID 18: byte[3] = C3 hw_proto, byte[1] = A  hw_proto */
+// Hardware protocol code from PIID 17/18 (byte positions aligned with Python ble_manager.py):
+// PIID 17: byte[3] = C1, byte[1] = C2; PIID 18: byte[3] = C3, byte[1] = A
 static uint8_t _get_hw_proto(uint8_t piid) {
     switch (piid) {
         case 1: return (_settings_valid[17] && ((_settings[17] >> 24) & 0xFF) > 0)
@@ -318,60 +302,17 @@ static uint8_t _get_hw_proto(uint8_t piid) {
 }
 
 static uint8_t _estimate_proto(uint8_t piid, float voltage, uint8_t code, uint8_t hw_protocol) {
-    /* Hardware protocol code (from PIID 17/18) takes priority over heuristic.
-       This aligns with Python state_protocol_v2.py which returns hw_protocol
-       immediately if non-zero, bypassing all voltage/code inference. */
     if (hw_protocol > 0) return hw_protocol;
-    if (piid == 1 || piid == 2) {
-        // PD 关闭时端口只能输出 5V (对齐 Python state_protocol_v2.py)
-        int pd_bit = (piid == 1) ? 0 : 8;
-        int pps_bit = (piid == 1) ? 1 : 9;
-        bool pd_enabled = (_settings_valid[21]) ? ((_settings[21] >> pd_bit) & 1) : true;
-        bool pps_enabled = (_settings_valid[21]) ? ((_settings[21] >> pps_bit) & 1) : true;
-        if (!pd_enabled && voltage > 0) return 1; // 5V
-        if (code == 0x08) return 8;
-        if (code == 0x70) { float md = _min_dist(voltage); return (md <= 0.05f) ? 7 : 3; }
-        if (code == 0x01 || code == 0x03 || code == 0x04 || code == 0x05 ||
-            code == 0x06 || code == 0x07 || code == 0x0A || code == 0x0B || code == 0x30) {
-            // Get PDO kind from PIID 17. Aligned with Python state_protocol_v2.py
-            // and main.c _get_pdo_kind(). C1 kind = byte[1], C2 kind = byte[3].
-            if (_settings_valid[17]) {
-                uint16_t port_word = (piid == 1)
-                    ? (_settings[17] & 0xFFFF)
-                    : ((_settings[17] >> 16) & 0xFFFF);
-                uint8_t pdo_kind = (port_word >> 8) & 0xFF;
-                if (pdo_kind == 0x08) {  // PDO PPS
-                    if (!pps_enabled) return 7;
-                    float md = _min_dist(voltage);
-                    return (md <= 0.05f) ? 7 : 8;
-                } else if (pdo_kind == 0x07) {  // PDO PD Fixed
-                    if (pps_enabled && voltage < 12.0f)
-                        return _estimate_pd_subtype(voltage);
-                    return 7;
-                }
-            }
-            // No PDO or unknown kind
-            if (!pps_enabled) return 7;
-            return _estimate_pd_subtype(voltage);
-        }
-        float md = _min_dist(voltage);
-        if (md <= 0.5f) return 7;
-        if (voltage >= 3.0f && voltage <= 21.0f) return 8;
-        return 0;
+    int pd_bit = (piid == 1) ? 0 : 8;
+    int pps_bit = (piid == 1) ? 1 : 9;
+    bool pd_enabled = (_settings_valid[21]) ? ((_settings[21] >> pd_bit) & 1) : true;
+    bool pps_enabled = (_settings_valid[21]) ? ((_settings[21] >> pps_bit) & 1) : true;
+    uint8_t pdo_kind = 0;
+    if ((piid == 1 || piid == 2) && _settings_valid[17]) {
+        uint16_t port_word = (piid == 1) ? (_settings[17] & 0xFFFF) : ((_settings[17] >> 16) & 0xFFFF);
+        pdo_kind = (port_word >> 8) & 0xFF;
     }
-    if (piid == 3) {
-        if (code == 0x70) return 3;
-        if (voltage >= 15.0f) return 7;
-        if (voltage >= 8.5f) return 3;
-        if (voltage <= 5.5f) return 1;
-        return voltage > 6.0f ? 3 : 1;
-    }
-    if (piid == 4) {
-        if (code == 0x70) return 3;
-        if (voltage > 5.5f) return 3;
-        if (voltage > 0) return 1;
-    }
-    return 0;
+    return estimate_protocol_shared(piid, voltage, code, pd_enabled, pps_enabled, pdo_kind, hw_protocol);
 }
 
 static void _parse_port(uint8_t piid, const uint8_t *pt, size_t pt_len) {
@@ -824,8 +765,8 @@ bool ble_manager_miot_set(uint8_t piid, uint32_t value) {
         if (_recv_cmd(resp, &rl, 2000)) { if (rl >= 8 && resp[4] == 0x04) ok = (resp[7] == piid); }
     } else if (rl >= 8 && resp[4] == 0x04) { ok = (resp[7] == piid); }
     NotifItem item;
-    QueueHandle_t qs[] = {_q_auth_ctrl, _q_auth_data, _q_cmd_send, _q_cmd_recv};
-    for (int i = 0; i < 4; i++) while (xQueueReceive(qs[i], &item, 0) == pdTRUE) {}
+    QueueHandle_t qs[] = {_q_auth_ctrl, _q_auth_data, _q_cmd_send};
+    for (int i = 0; i < 3; i++) while (xQueueReceive(qs[i], &item, 0) == pdTRUE) {}
     return ok;
 }
 
@@ -969,8 +910,29 @@ static void _disable_all_notifications(void) {
  * Public API
  * ============================================================ */
 void ble_manager_init(const char *device_mac, const char *device_token, const char *device_ble_key) {
-    _q_auth_ctrl = xQueueCreate(NOTIF_QUEUE_LEN, sizeof(NotifItem));
-    _q_auth_data = xQueueCreate(NOTIF_QUEUE_LEN, sizeof(NotifItem));
+    /* Validate BLE config before initializing NimBLE. If MAC/token/key
+       are missing or ill-formed, skip BLE entirely — no scanning, no
+       repeated connection attempts. */
+    uint8_t mac[6];
+    bool mac_ok = (device_mac && strlen(device_mac) == 17 &&
+                   sscanf(device_mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                          &mac[5], &mac[4], &mac[3], &mac[2], &mac[1], &mac[0]) == 6);
+    bool token_ok = (device_token && strlen(device_token) >= 1);
+
+    if (!mac_ok || !token_ok) {
+        ESP_LOGW(TAG, "BLE config incomplete (mac=%s token=%s len=%d) — BLE disabled",
+                 device_mac ? "set" : "null",
+                 device_token ? (strlen(device_token) > 8 ? "set" : "short") : "null",
+                 device_token ? (int)strlen(device_token) : 0);
+        _enabled = false;
+        _state = BLE_IDLE;
+        snprintf(_mac_str, sizeof(_mac_str), "%s", device_mac ? device_mac : "");
+        return;
+    }
+
+    memcpy(_target_addr, mac, 6);
+    _q_auth_ctrl = xQueueCreate(NOTIF_QUEUE_LEN_AUTH, sizeof(NotifItem));
+    _q_auth_data = xQueueCreate(NOTIF_QUEUE_LEN_AUTH, sizeof(NotifItem));
     _q_cmd_send  = xQueueCreate(NOTIF_QUEUE_LEN, sizeof(NotifItem));
     _q_cmd_recv  = xQueueCreate(NOTIF_QUEUE_LEN, sizeof(NotifItem));
     _op_sem = xSemaphoreCreateBinary();
@@ -978,12 +940,7 @@ void ble_manager_init(const char *device_mac, const char *device_token, const ch
     _disc_sem = xSemaphoreCreateBinary();
     _disconnect_sem = xSemaphoreCreateBinary();
 
-    if (sscanf(device_mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-           &_target_addr[5], &_target_addr[4], &_target_addr[3],
-           &_target_addr[2], &_target_addr[1], &_target_addr[0]) != 6) {
-        ESP_LOGE(TAG, "Invalid MAC: %s", device_mac);
-    }
-    snprintf(_mac_str, sizeof(_mac_str), "%s", device_mac ? device_mac : "");
+    snprintf(_mac_str, sizeof(_mac_str), "%s", device_mac);
     for (int i = 0; i < 12; i++) { char hex[3] = {device_token[i*2], device_token[i*2+1], 0}; _token[i] = (uint8_t)strtol(hex, NULL, 16); }
 
     ESP_LOGI(TAG, "Init NimBLE...");

@@ -4,6 +4,7 @@
 #include "esp_wifi.h"
 #include "esp_coexist.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 #include "embedded_files.h"
 #include "ble_manager.h"
@@ -34,36 +35,100 @@ void http_server_set_callbacks(port_data_cb ports, settings_cb settings,
 
 /* ==================== Ping / Health Check ==================== */
 
+
+/* cJSON memory pool with automatic heap fallback.
+ *
+   Each API handler resets pool_pos to 0 on entry.  cJSON objects are
+   allocated from the pool instead of the heap.  cJSON_Delete becomes a
+   no-op for pool allocations — the entire pool is reused when the next
+   request starts.
+ *
+   When the pool is exhausted (deeply nested responses), allocations
+   fall back to the heap.  _cjson_free distinguishes pool vs heap
+   pointers and actually frees heap allocations.
+ *
+   This eliminates thousands of tiny malloc/free calls (the single biggest
+   source of heap fragmentation in the firmware) while still being safe
+   under edge-case memory pressure. */
+
+static char _cjson_pool[4096];
+static size_t _cjson_pool_pos = 0;
+static size_t _cjson_pool_peak = 0;   // high-water mark for diagnostics
+static bool _cjson_pool_overflow = false;  // true if any heap fallback occurred
+
+#define CJSON_RESET() do { _cjson_pool_pos = 0; } while(0)
+
+static void *_cjson_alloc(size_t sz) {
+    size_t aligned = (sz + 3) & ~3;
+    if (_cjson_pool_pos + aligned <= sizeof(_cjson_pool)) {
+        void *p = _cjson_pool + _cjson_pool_pos;
+        _cjson_pool_pos += aligned;
+        if (_cjson_pool_pos > _cjson_pool_peak) _cjson_pool_peak = _cjson_pool_pos;
+        return p;
+    }
+    /* Pool exhausted — fall back to heap.  Caller will still work
+       correctly (no NULL returns) at the cost of some fragmentation. */
+    if (!_cjson_pool_overflow) {
+        _cjson_pool_overflow = true;
+        ESP_LOGW(TAG, "cJSON pool exhausted (%u/%u), falling back to heap",
+                 (unsigned)_cjson_pool_pos, (unsigned)sizeof(_cjson_pool));
+    }
+    return malloc(sz);
+}
+
+static void _cjson_free(void *ptr) {
+    if (!ptr) return;
+    /* If the pointer is within the pool range, it's a pooled allocation —
+       no-op, freed when the next request resets pool_pos. */
+    if ((char*)ptr >= _cjson_pool && (char*)ptr < _cjson_pool + sizeof(_cjson_pool))
+        return;
+    free(ptr);
+}
+
+/* GC: reset pool and report diagnostics.  Called from app_task on
+   heap pressure.  Returns peak pool usage for the caller's log. */
+size_t http_server_pool_gc(void) {
+    size_t peak = _cjson_pool_peak;
+    if (_cjson_pool_overflow)
+        ESP_LOGI(TAG, "Pool GC: peak=%u/%u overflow=Y", (unsigned)peak, (unsigned)sizeof(_cjson_pool));
+    else
+        ESP_LOGD(TAG, "Pool GC: peak=%u/%u", (unsigned)peak, (unsigned)sizeof(_cjson_pool));
+    _cjson_pool_pos = 0;
+    _cjson_pool_peak = 0;
+    _cjson_pool_overflow = false;
+    return peak;
+}
+
 static int _get_ping_handler(httpd_req_t *req) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "ok", true);
-    cJSON_AddStringToObject(root, "service", "cuktech_charger_esp32");
-    char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_sendstr(req, json);
-    cJSON_free(json); cJSON_Delete(root);
+    httpd_resp_sendstr(req, "{\"ok\":true,\"service\":\"cuktech_charger_esp32\"}");
     return 0;
 }
+
+/* Static buffer for cJSON_PrintPreallocated — avoids per-request malloc/free
+   of the 512B-4KB JSON string. 3KB fits all API responses. */
+static char _json_buf[2048];
 
 /* ==================== Status API (for HA integration validation) ==================== */
 
 static int _get_status_handler(httpd_req_t *req) {
-    bool ble_ready = ble_manager_is_ready();
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "ok", true);
-    cJSON_AddBoolToObject(root, "connected", ble_ready);
-    cJSON_AddBoolToObject(root, "authenticated", ble_ready);
-    cJSON_AddBoolToObject(root, "ble_enabled", ble_manager_is_enabled());
-    cJSON_AddBoolToObject(root, "ble_ready", ble_ready);
-    cJSON_AddNumberToObject(root, "free_heap", esp_get_free_heap_size());
-    cJSON_AddStringToObject(root, "device_model", DEVICE_MODEL);
-    cJSON_AddStringToObject(root, "firmware_version", FW_VERSION);
-    char *json = cJSON_PrintUnformatted(root);
+    bool ready = ble_manager_is_ready();
+    char buf[384];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"connected\":%s,\"authenticated\":%s,"
+        "\"ble_enabled\":%s,\"ble_ready\":%s,\"free_heap\":%u,"
+        "\"min_free_heap\":%u,\"max_block\":%u,"
+        "\"device_model\":\"%s\",\"firmware_version\":\"%s\"}",
+        ready ? "true" : "false", ready ? "true" : "false",
+        ble_manager_is_enabled() ? "true" : "false",
+        ready ? "true" : "false", (unsigned)esp_get_free_heap_size(),
+        (unsigned)esp_get_minimum_free_heap_size(),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+        DEVICE_MODEL, FW_VERSION);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_sendstr(req, json);
-    cJSON_free(json); cJSON_Delete(root);
+    httpd_resp_send(req, buf, n);
     return 0;
 }
 
@@ -92,45 +157,56 @@ static void _mask_str(const char *in, char *out, size_t out_size) {
     out[copy_front + 4 + copy_back] = '\0';
 }
 
-/* Buffer large enough for any masked value: up to 65 chars → 12 chars, safe */
-#define MASK_BUF_SIZE 16
-
-static void _json_cfg(cJSON *root) {
-    char mask[MASK_BUF_SIZE];
-    cJSON_AddStringToObject(root, "wifi_ssid", _cfg->wifi_ssid);
-    _mask_str(_cfg->wifi_pass, mask, sizeof(mask));
-    cJSON_AddStringToObject(root, "wifi_pass", mask);
-    cJSON_AddStringToObject(root, "device_mac", _cfg->device_mac);
-    _mask_str(_cfg->device_token, mask, sizeof(mask));
-    cJSON_AddStringToObject(root, "device_token", mask);
-    _mask_str(_cfg->device_ble_key, mask, sizeof(mask));
-    cJSON_AddStringToObject(root, "device_ble_key", mask);
-    cJSON_AddStringToObject(root, "mqtt_broker", _cfg->mqtt_broker);
-    cJSON_AddNumberToObject(root, "mqtt_port", _cfg->mqtt_port);
-    cJSON_AddStringToObject(root, "mqtt_user", _cfg->mqtt_user);
-    _mask_str(_cfg->mqtt_pass, mask, sizeof(mask));
-    cJSON_AddStringToObject(root, "mqtt_pass", mask);
-    cJSON_AddStringToObject(root, "mqtt_topic_prefix", _cfg->mqtt_topic_prefix);
-    cJSON_AddBoolToObject(root, "mqtt_enable", _cfg->mqtt_enable);
-    cJSON_AddBoolToObject(root, "bemfa_enable", _cfg->bemfa_enable);
-    _mask_str(_cfg->bemfa_uid, mask, sizeof(mask));
-    cJSON_AddStringToObject(root, "bemfa_uid", mask);
-    cJSON_AddStringToObject(root, "bemfa_name_c1", _cfg->bemfa_name_c1);
-    cJSON_AddStringToObject(root, "bemfa_name_c2", _cfg->bemfa_name_c2);
-    cJSON_AddStringToObject(root, "bemfa_name_c3", _cfg->bemfa_name_c3);
-    cJSON_AddStringToObject(root, "bemfa_name_a", _cfg->bemfa_name_a);
-    cJSON_AddStringToObject(root, "bemfa_name_ble", _cfg->bemfa_name_ble);
-}
-
 static int _get_config_handler(httpd_req_t *req) {
-    cJSON *root = cJSON_CreateObject();
-    _json_cfg(root);
-    char *json = cJSON_PrintUnformatted(root);
+    /* Mask sensitive values first */
+    char mask_ws[16], mask_tk[16], mask_bk[16], mask_mp[16], mask_uid[16];
+    _mask_str(_cfg->wifi_pass, mask_ws, sizeof(mask_ws));
+    _mask_str(_cfg->device_token, mask_tk, sizeof(mask_tk));
+    _mask_str(_cfg->device_ble_key, mask_bk, sizeof(mask_bk));
+    _mask_str(_cfg->mqtt_pass, mask_mp, sizeof(mask_mp));
+    _mask_str(_cfg->bemfa_uid, mask_uid, sizeof(mask_uid));
+
+    int n = snprintf(_json_buf, sizeof(_json_buf),
+        "{"
+        "\"wifi_ssid\":\"%s\","
+        "\"wifi_pass\":\"%s\","
+        "\"device_mac\":\"%s\","
+        "\"device_token\":\"%s\","
+        "\"device_ble_key\":\"%s\","
+        "\"mqtt_broker\":\"%s\","
+        "\"mqtt_port\":%u,"
+        "\"mqtt_user\":\"%s\","
+        "\"mqtt_pass\":\"%s\","
+        "\"mqtt_topic_prefix\":\"%s\","
+        "\"mqtt_enable\":%s,"
+        "\"bemfa_enable\":%s,"
+        "\"bemfa_uid\":\"%s\","
+        "\"bemfa_name_c1\":\"%s\","
+        "\"bemfa_name_c2\":\"%s\","
+        "\"bemfa_name_c3\":\"%s\","
+        "\"bemfa_name_a\":\"%s\","
+        "\"bemfa_name_ble\":\"%s\""
+        "}",
+        _cfg->wifi_ssid, mask_ws,
+        _cfg->device_mac, mask_tk, mask_bk,
+        _cfg->mqtt_broker, (unsigned)_cfg->mqtt_port,
+        _cfg->mqtt_user, mask_mp,
+        _cfg->mqtt_topic_prefix,
+        _cfg->mqtt_enable ? "true" : "false",
+        _cfg->bemfa_enable ? "true" : "false",
+        mask_uid,
+        _cfg->bemfa_name_c1, _cfg->bemfa_name_c2, _cfg->bemfa_name_c3,
+        _cfg->bemfa_name_a, _cfg->bemfa_name_ble);
+
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    cJSON_free(json); cJSON_Delete(root);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (n > 0 && (size_t)n < sizeof(_json_buf))
+        httpd_resp_send(req, _json_buf, n);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
     return 0;
 }
+
 
 /* Helper: send JSON error instead of 500 (which causes browser retries) */
 static void _json_error(httpd_req_t *req, const char *msg) {
@@ -140,6 +216,8 @@ static void _json_error(httpd_req_t *req, const char *msg) {
 }
 
 static int _post_config_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
     char buf[1024];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) { _json_error(req, "empty"); return 0; }
@@ -209,10 +287,12 @@ static int _post_config_handler(httpd_req_t *req) {
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", true);
     cJSON_AddStringToObject(resp, "message", "Config saved. Rebooting...");
-    char *rjson = cJSON_PrintUnformatted(resp);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, rjson);
-    cJSON_free(rjson); cJSON_Delete(resp);
+    if (cJSON_PrintPreallocated(resp, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(resp);
 
     if (_on_save) _on_save();
     return 0;
@@ -221,27 +301,75 @@ static int _post_config_handler(httpd_req_t *req) {
 /* ==================== Dashboard API ==================== */
 
 static int _get_ports_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
     if (!_port_data_cb) { _json_error(req, "error"); return 0; }
     cJSON *root = _port_data_cb();
-    char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_sendstr(req, json);
-    cJSON_free(json); cJSON_Delete(root);
+    if (cJSON_PrintPreallocated(root, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(root);
     return 0;
 }
 
 static int _get_settings_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
     if (!_settings_cb) { _json_error(req, "error"); return 0; }
     cJSON *root = _settings_cb();
-    char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    cJSON_free(json); cJSON_Delete(root);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (cJSON_PrintPreallocated(root, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(root);
+    return 0;
+}
+
+/* Combined endpoint: returns status + ports + settings in one request.
+   Replaces 3 separate fetches in the frontend, reducing TCP buffer pressure. */
+static int _get_all_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
+    bool ready = ble_manager_is_ready();
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddBoolToObject(root, "connected", ready);
+    cJSON_AddBoolToObject(root, "authenticated", ready);
+    cJSON_AddBoolToObject(root, "ble_enabled", ble_manager_is_enabled());
+    cJSON_AddBoolToObject(root, "ble_ready", ready);
+    cJSON_AddNumberToObject(root, "free_heap", esp_get_free_heap_size());
+    cJSON_AddNumberToObject(root, "min_free_heap", esp_get_minimum_free_heap_size());
+    cJSON_AddNumberToObject(root, "max_block", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    cJSON_AddStringToObject(root, "device_model", DEVICE_MODEL);
+    cJSON_AddStringToObject(root, "firmware_version", FW_VERSION);
+
+    if (_port_data_cb) {
+        cJSON *ports = _port_data_cb();
+        if (ports) cJSON_AddItemToObject(root, "ports", ports);
+    }
+    if (_settings_cb) {
+        cJSON *settings = _settings_cb();
+        if (settings) cJSON_AddItemToObject(root, "settings", settings);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (cJSON_PrintPreallocated(root, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(root);
     return 0;
 }
 
 static int _post_port_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
     char buf[256];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) { _json_error(req, "error"); return 0; }
@@ -259,14 +387,18 @@ static int _post_port_handler(httpd_req_t *req) {
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", ok);
-    char *rjson = cJSON_PrintUnformatted(resp);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, rjson);
-    cJSON_free(rjson); cJSON_Delete(resp);
+    if (cJSON_PrintPreallocated(resp, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(resp);
     return 0;
 }
 
 static int _post_setting_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
     char buf[256];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) { _json_error(req, "error"); return 0; }
@@ -284,16 +416,20 @@ static int _post_setting_handler(httpd_req_t *req) {
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", ok);
-    char *rjson = cJSON_PrintUnformatted(resp);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, rjson);
-    cJSON_free(rjson); cJSON_Delete(resp);
+    if (cJSON_PrintPreallocated(resp, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(resp);
     return 0;
 }
 
 /* ==================== BLE Control API ==================== */
 
 static int _post_ble_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
     char buf[128];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) { _json_error(req, "error"); return 0; }
@@ -308,16 +444,20 @@ static int _post_ble_handler(httpd_req_t *req) {
     cJSON_Delete(root);
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", ok);
-    char *rjson = cJSON_PrintUnformatted(resp);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, rjson);
-    cJSON_free(rjson); cJSON_Delete(resp);
+    if (cJSON_PrintPreallocated(resp, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(resp);
     return 0;
 }
 
 /* ==================== Protocol Toggle API ==================== */
 
 static int _post_protocol_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
     char buf[256];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) { _json_error(req, "error"); return 0; }
@@ -335,10 +475,12 @@ static int _post_protocol_handler(httpd_req_t *req) {
     cJSON_Delete(root);
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", ok);
-    char *rjson = cJSON_PrintUnformatted(resp);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, rjson);
-    cJSON_free(rjson); cJSON_Delete(resp);
+    if (cJSON_PrintPreallocated(resp, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(resp);
     return 0;
 }
 
@@ -348,6 +490,8 @@ static const char *SCR_LABELS[] = {"5分钟", "1分钟", "10分钟", "30分钟",
 #define SCR_COUNT 5
 
 static int _get_sleep_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
     if (!_settings_cb) { _json_error(req, "error"); return 0; }
     cJSON *root = _settings_cb();
     int val = 0;
@@ -357,14 +501,18 @@ static int _get_sleep_handler(httpd_req_t *req) {
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddNumberToObject(resp, "value", val);
     cJSON_AddStringToObject(resp, "label", (val >= 0 && val < SCR_COUNT) ? SCR_LABELS[val] : "?");
-    char *json = cJSON_PrintUnformatted(resp);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    cJSON_free(json); cJSON_Delete(resp);
+    if (cJSON_PrintPreallocated(resp, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(resp);
     return 0;
 }
 
 static int _post_sleep_handler(httpd_req_t *req) {
+    _cjson_pool_pos = 0;
+
     char buf[128];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (len <= 0) { _json_error(req, "error"); return 0; }
@@ -380,10 +528,12 @@ static int _post_sleep_handler(httpd_req_t *req) {
     cJSON_Delete(root);
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "ok", ok);
-    char *rjson = cJSON_PrintUnformatted(resp);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, rjson);
-    cJSON_free(rjson); cJSON_Delete(resp);
+    if (cJSON_PrintPreallocated(resp, _json_buf, sizeof(_json_buf), false))
+        httpd_resp_sendstr(req, _json_buf);
+    else
+        httpd_resp_sendstr(req, "{\"error\":\"buffer_full\"}");
+    cJSON_Delete(resp);
     return 0;
 }
 
@@ -409,7 +559,7 @@ static void _serve_embedded(httpd_req_t *req, const EmbeddedFile *f) {
     if (f->encoding) {
         httpd_resp_set_hdr(req, "Content-Encoding", f->encoding);
     }
-    httpd_resp_set_hdr(req, "Cache-Control", "max-age=86400");
+    httpd_resp_set_hdr(req, "Cache-Control", "max-age=604800");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     const uint8_t *p = f->data;
     size_t left = f->size;
@@ -483,11 +633,18 @@ static int _get_static_handler(httpd_req_t *req) {
 void http_server_start(DeviceConfig *cfg, http_config_cb on_save) {
     _cfg = cfg;
     _on_save = on_save;
+    /* Initialize cJSON memory pool to reduce heap fragmentation */
+    {
+        cJSON_Hooks hooks = { .malloc_fn = _cjson_alloc, .free_fn = _cjson_free };
+        cJSON_InitHooks(&hooks);
+    }
+
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 80;
+    config.max_open_sockets = 8;
     config.server_port = 80;
-    config.max_resp_headers = 4096;
+    config.max_resp_headers = 1024;  /* 4KB was overkill — 1KB covers all JSON responses */
     config.stack_size = 8192;
     config.send_wait_timeout = 10;  /* seconds; default 5, increase for BLE coexistence */
 
@@ -500,6 +657,7 @@ void http_server_start(DeviceConfig *cfg, http_config_cb on_save) {
     const httpd_uri_t uris[] = {
         { .uri = "/api/ping",     .method = HTTP_GET,  .handler = _get_ping_handler },
         { .uri = "/api/status",   .method = HTTP_GET,  .handler = _get_status_handler },
+        { .uri = "/api/all",      .method = HTTP_GET,  .handler = _get_all_handler },
         { .uri = "/api/config",   .method = HTTP_GET,  .handler = _get_config_handler },
         { .uri = "/api/config",   .method = HTTP_POST, .handler = _post_config_handler },
         { .uri = "/api/ports",    .method = HTTP_GET,  .handler = _get_ports_handler },
@@ -528,9 +686,6 @@ void http_server_start(DeviceConfig *cfg, http_config_cb on_save) {
         if (err != ESP_OK) ESP_LOGE(TAG, "Register FAILED: %s (%s)", f->path, esp_err_to_name(err));
         else               ESP_LOGI(TAG, "Registered: %s → %s (%d bytes)", f->path, f->content_type, (int)f->size);
     }
-    /* Browser default favicon path → serve embedded /static/favicon.ico */
-    static_uri.uri = "/favicon.ico";
-    httpd_register_uri_handler(_server, &static_uri);
     ESP_LOGI(TAG, "HTTP server started on port 80");
 }
 
