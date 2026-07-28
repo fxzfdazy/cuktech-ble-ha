@@ -2,6 +2,7 @@
 #include "config.h"
 #include "esp_http_server.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "embedded_files.h"
@@ -361,18 +362,48 @@ static const EmbeddedFile *_find_embedded(const char *path) {
     return NULL;
 }
 
-/* Send embedded file. Uses httpd_resp_send() which handles TCP
-   backpressure internally and sets Content-Length automatically.
-   Cache is set to 1 day so browsers won't re-request images on every
-   page load. */
+/* Send embedded file via chunked transfer. Temporarily switches WiFi/BLE
+   coexistence to WiFi-priority so large files don't time out when BLE is
+   actively exchanging data. Restores balance mode when done. */
 static void _serve_embedded(httpd_req_t *req, const EmbeddedFile *f) {
+    /* Boost WiFi priority during file transfer to prevent TCP timeouts
+       caused by BLE radio contention on the single 2.4 GHz antenna.
+       Restored to BALANCE before returning. */
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+
     httpd_resp_set_type(req, f->content_type);
     if (f->encoding) {
         httpd_resp_set_hdr(req, "Content-Encoding", f->encoding);
     }
     httpd_resp_set_hdr(req, "Cache-Control", "max-age=86400");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_send(req, (const char *)f->data, f->size);
+    const uint8_t *p = f->data;
+    size_t left = f->size;
+    const size_t CHUNK = 4096;
+    while (left > 0) {
+        size_t n = (left > CHUNK) ? CHUNK : left;
+        esp_err_t err;
+        int retries = 8;
+        int delay_ms = 5;
+        do {
+            err = httpd_resp_send_chunk(req, (const char *)p, n);
+            if (err == ESP_ERR_HTTPD_RESP_SEND) {
+                vTaskDelay(pdMS_TO_TICKS(delay_ms));
+                delay_ms *= 2;
+            }
+        } while (err == ESP_ERR_HTTPD_RESP_SEND && --retries > 0);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Send chunk FAILED for %s (%d bytes remaining)", f->path, (int)left);
+            httpd_resp_send_chunk(req, NULL, 0);
+            esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+            return;
+        }
+        p += n;
+        left -= n;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
     ESP_LOGI(TAG, "Served: %s (%d bytes)", f->path, (int)f->size);
 }
 
@@ -420,10 +451,11 @@ void http_server_start(DeviceConfig *cfg, http_config_cb on_save) {
     _on_save = on_save;
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 64;
+    config.max_uri_handlers = 80;
     config.server_port = 80;
     config.max_resp_headers = 4096;
     config.stack_size = 8192;
+    config.send_wait_timeout = 10;  /* seconds; default 5, increase for BLE coexistence */
 
     if (httpd_start(&_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server");
@@ -462,6 +494,9 @@ void http_server_start(DeviceConfig *cfg, http_config_cb on_save) {
         if (err != ESP_OK) ESP_LOGE(TAG, "Register FAILED: %s (%s)", f->path, esp_err_to_name(err));
         else               ESP_LOGI(TAG, "Registered: %s → %s (%d bytes)", f->path, f->content_type, (int)f->size);
     }
+    /* Browser default favicon path → serve embedded /static/favicon.ico */
+    static_uri.uri = "/favicon.ico";
+    httpd_register_uri_handler(_server, &static_uri);
     ESP_LOGI(TAG, "HTTP server started on port 80");
 }
 

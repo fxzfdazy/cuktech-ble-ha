@@ -1,5 +1,30 @@
 # ESP32 BLE 固件发布说明
 
+## v1.1.0
+
+### 新增
+- **前端嵌入**: 完全重构前端页面，全部前端资源（HTML/CSS/JS/图片）嵌入固件，无需外部服务器或 SPIFFS
+- **OTA**: 移除OTA功能，app 分区扩至 3.875MB，4% 空闲 → 26% 空闲
+- **BLE 延时连接**: 启动后 60s 延迟连接 BLE，前端可手动提前触发
+- **配置脱敏**: 敏感字段（WiFi 密码、设备密钥、MQTT 密码等）API 返回时自动脱敏，保存时跳过 `****`
+
+### 优化
+- **协议检测**: 硬件协议码（PIID 17/18）优先，PDO kind + PPS 开关完整检查链，阈值对齐 `0.05V`
+- **WiFi/BLE 共存**: 大文件传输时动态切换 `ESP_COEX_PREFER_WIFI`，发送完恢复 BALANCE
+- **内存优化**: NimBLE 缓冲区池裁剪（约节省 17KB），TCP 发送缓冲 8192，MQTT 任务栈 4096
+- **大文件分块传输**: 4096 字节分块 + 指数退避重试（最大 8 次，1.27s），抑制 EAGAIN 断连
+- **HTTP 超时**: `send_wait_timeout` 5s → 10s，撑过 BLE 繁忙期
+- **端口去抖动**: 500ms（原 2000ms），减少断开检测延迟
+- **通知队列**: `NOTIF_QUEUE_LEN` 8 → 16，降低推送溢出风险
+- **result_queue**: 32 → 48，xQueueSend 增加 50ms 超时 + 丢弃日志
+- **NimBLE 内存参数回调**: `ACL_BUF_SIZE` 128→255，`HCI_EVT_BUF_SIZE` 128→256 等，确保服务发现正常
+- **HTML gzip**: phone.html 80% 压缩，config.html 76% 压缩
+
+### 构建
+- ESP-IDF v5.3.5
+- NimBLE Central
+- ESP-MQTT + cJSON + mbedTLS
+
 ## v1.0.3
 
 ### 新增

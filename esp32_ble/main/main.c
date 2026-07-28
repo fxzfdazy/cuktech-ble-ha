@@ -40,6 +40,12 @@ QueueHandle_t cmd_queue = NULL;
 QueueHandle_t urgent_queue = NULL;  // higher priority: port commands, user SETs
 QueueHandle_t result_queue = NULL;
 
+// Semaphore for delayed BLE connection.
+// Created in system_manager, taken by ble_task to wait (timeout = BLE_CONNECT_DELAY_S s).
+// Given by handle_ble_control() when frontend user clicks "连接设备".
+static SemaphoreHandle_t ble_connect_sem = NULL;
+#define BLE_CONNECT_DELAY_S 60
+
 // ============================================================
 // Shared state
 // ============================================================
@@ -139,23 +145,28 @@ static uint8_t estimate_protocol(uint8_t piid, float voltage, uint8_t code,
         if (!pd_enabled && voltage > 0) return 1;
         if (code == 0x08) return 8;
         if (code == 0x70) {
-            if (_min_dist_to_pd(voltage) <= 0.3f) return 7;
+            // Python: score > 0.9 → min_dist < 0.05V → PD; else QC
+            if (_min_dist_to_pd(voltage) <= 0.05f) return 7;
             return 3;
         }
         if (code == 0x01 || code == 0x03 || code == 0x04 || code == 0x05 ||
             code == 0x06 || code == 0x07 || code == 0x0A || code == 0x0B || code == 0x30) {
+            int pps_bit = (idx == 0) ? 1 : 9;
+            bool pps_enabled = (protocol_extend_val >> pps_bit) & 1;
             int pdo_kind = settings_valid[17] ? _get_pdo_kind(idx) : 0;
             if (pdo_kind == 0x08) {  // PDO PPS
+                if (!pps_enabled) return 7;  // PPS switched off → PD
                 float md = _min_dist_to_pd(voltage);
                 if (md <= 0.05f) return 7;   // exact PD fixed match
                 return 8;                     // PPS
             } else if (pdo_kind == 0x07) {    // PDO PD Fixed
-                // If PPS enabled (from protocol_extend) and voltage < 12V → could be PPS
-                // Simplified: use _pd_subtype
-                return _pd_subtype(voltage);
+                if (pps_enabled && voltage < 12.0f)
+                    return _pd_subtype(voltage);  // may be PPS if no exact match
+                return 7;                          // PD
             }
-            // No PDO data — use voltage-based estimation
-            return _pd_subtype(voltage);
+            // No PDO data
+            if (!pps_enabled) return 7;      // PPS off → PD
+            return _pd_subtype(voltage);      // voltage-based
         }
         // Other codes — voltage fallback (matches Python loose match + PPS range)
         float md = _min_dist_to_pd(voltage);
@@ -164,7 +175,14 @@ static uint8_t estimate_protocol(uint8_t piid, float voltage, uint8_t code,
         return 0;
     }
     if (piid == 3) {
-        if (code == 0x70) return 3;
+        if (code == 0x70) {
+            // Python: check PDO first — if PD Fixed/PPS, return 7; else QC
+            if (settings_valid[18]) {
+                int pdo_kind = _get_pdo_kind(2);  // idx=2 for C3
+                if (pdo_kind == 0x07 || pdo_kind == 0x08) return 7;
+            }
+            return 3;
+        }
         if (voltage >= 15.0) return 7;
         if (voltage >= 8.5) return 3;
         if (voltage <= 5.5) return 1;
@@ -314,6 +332,11 @@ static bool handle_protocol_toggle(const char *port, const char *protocol, bool 
 static bool handle_ble_control(bool enable) {
     ble_enabled = enable;
     ble_manager_set_enabled(enable);
+    if (enable && ble_connect_sem) {
+        /* Give the semaphore to wake up ble_task early (if it's still
+           in the delayed-start window). Safe to call multiple times. */
+        xSemaphoreGive(ble_connect_sem);
+    }
     publish_status();
     ESP_LOGI(TAG, "HTTP BLE %s", enable ? "enable" : "disable");
     return true;
@@ -495,6 +518,8 @@ static void mqtt_init(void) {
         .credentials.username = g_cfg.mqtt_user,
         .credentials.authentication.password = g_cfg.mqtt_pass,
         .credentials.client_id = client_id,
+        .buffer.out_size = 512,
+        .task.stack_size = 4096,
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -512,10 +537,6 @@ static void mqtt_init(void) {}
 #endif
 
 // ============================================================
-// WiFi STA
-// ============================================================
-
-static EventGroupHandle_t wifi_event_group = NULL;
 // ============================================================
 // System Manager — event-driven startup state machine
 // ============================================================
@@ -609,8 +630,19 @@ static void on_ble_state_change(BLEState old_state, BLEState new_state) {
 
 static void ble_task(void *pvParameters) {
     ESP_LOGI(TAG, "BLE task started");
-    /* Extra delay to let WiFi fully stabilize before BLE radio activity */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    /* Delayed BLE connection: wait up to BLE_CONNECT_DELAY_S for the
+       semaphore, or until the frontend user clicks "连接设备" to give
+       the semaphore early. This lets WiFi settle and avoids BLE radio
+       contention during initial page loads / image transfers. */
+    if (ble_connect_sem) {
+        TickType_t timeout = pdMS_TO_TICKS(BLE_CONNECT_DELAY_S * 1000);
+        if (xSemaphoreTake(ble_connect_sem, timeout) == pdTRUE) {
+            ESP_LOGI(TAG, "BLE connect triggered early by frontend");
+        } else {
+            ESP_LOGI(TAG, "BLE connect delay expired (%ds), starting now", BLE_CONNECT_DELAY_S);
+        }
+    }
 
     ble_manager_set_state_callback(on_ble_state_change);
     ble_manager_set_port_data_callback(NULL);
@@ -742,7 +774,11 @@ static void app_task(void* pvParameters) {
 
 #if ENABLE_MQTT
         // MQTT health check with exponential backoff
-        if (now - last_mqtt_ok > 60000 && last_mqtt_ok > 0) {
+        if (last_mqtt_ok == 0) {
+            // Mark first "start" time after boot so the 60s timer below works
+            last_mqtt_ok = now;
+        }
+        if (now - last_mqtt_ok > 60000) {
             uint32_t interval = (mqtt_restart_count < 3) ? 60 : (mqtt_restart_count < 6) ? 300 : 600;
             if (now - last_mqtt_restart >= interval) {
                 ESP_LOGW(TAG, "MQTT no activity %lus, restarting (attempt %d)...", (unsigned long)(now - last_mqtt_ok) / 1000, mqtt_restart_count + 1);
@@ -803,11 +839,11 @@ static void app_task(void* pvParameters) {
                     uint8_t proto = estimate_protocol(res.piid, v, code, 0, pd_on, hw_proto);
                     bool was_active = port_data[idx].active;
                     // Debounce: skip zero-value GET if port was previously active
-                    // and we're within 2s of a non-port-control SET (protocol transitions).
+                    // and we're within 500ms of a non-port-control SET (protocol transitions).
                     uint64_t now = esp_timer_get_time() / 1000;
                     bool nearly_zero = (v < 0.1f && c < 0.1f && st == 0);
                     if (nearly_zero && port_data[idx].valid && port_data[idx].active && last_set_piid != 16) {
-                        if (now - last_set_time < 2000) {
+                        if (now - last_set_time < 500) {
                             UNLOCK_STATE();
                             break;
                         }
@@ -816,7 +852,7 @@ static void app_task(void* pvParameters) {
                     bool publish = false;
                     if (was_active != port_data[idx].active) publish = true;
                     if (!port_data[idx].valid) publish = true;
-                    if (now - last_set_time < 2000 && (last_set_piid == 16 || last_set_piid == 21)) {
+                    if (now - last_set_time < 500 && (last_set_piid == 16 || last_set_piid == 21)) {
                         publish = true;
                     }
                     UNLOCK_STATE();
@@ -892,12 +928,12 @@ static void app_task(void* pvParameters) {
             }
         }
 
-        // Periodically GET port data (PIID 1-4), scene mode (PIID 5),
-        // screen time (PIID 6), trickle (PIID 15), protocol switches (PIID 21),
+        // Periodically GET scene mode (PIID 5), screen time (PIID 6),
+        // trickle (PIID 15), protocol switches (PIID 21),
         // countdown values (PIID 9-12), and port control (PIID 16)
         if (ble_ready_flag && (now - last_cd_fetch >= 30000)) {
             last_cd_fetch = now;
-            static const uint8_t CD_PIIDS[] = {1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 15, 16, 21};
+            static const uint8_t CD_PIIDS[] = {5, 6, 9, 10, 11, 12, 15, 16, 21};
             for (int i = 0; i < sizeof(CD_PIIDS); i++) {
                 BleCommand c = {CMD_GET, CD_PIIDS[i], 0, 0};
                 xQueueSend(cmd_queue, &c, 0);
@@ -942,11 +978,13 @@ static void enter_ap_mode(bool net_init_done) {
     if (!net_init_done) {
         ESP_ERROR_CHECK(esp_netif_init());
         ESP_ERROR_CHECK(esp_event_loop_create_default());
+        esp_netif_create_default_wifi_ap();
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    } else {
+        // WiFi already initialized by system_manager — just create AP netif
+        esp_netif_create_default_wifi_ap();
     }
-    esp_netif_create_default_wifi_ap();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     wifi_config_t ap_config = {
         .ap = {
@@ -1027,7 +1065,7 @@ static void system_manager(void) {
 
     cmd_queue = xQueueCreate(20, sizeof(BleCommand));
     urgent_queue = xQueueCreate(4, sizeof(BleCommand));
-    result_queue = xQueueCreate(32, sizeof(BleResult));
+    result_queue = xQueueCreate(48, sizeof(BleResult));
     state_mutex = xSemaphoreCreateMutex();
 
     http_server_set_callbacks(get_port_data_json, get_settings_json,
@@ -1036,6 +1074,10 @@ static void system_manager(void) {
                               handle_ble_control);
     http_server_start(&g_cfg, ap_reboot_callback);
     ESP_LOGI(TAG, "HTTP server ready");
+
+    /* Create semaphore for delayed BLE connection. ble_task will wait
+       on this semaphore; handle_ble_control can give it to wake up early. */
+    ble_connect_sem = xSemaphoreCreateBinary();
 
     /* ---- Stage: BLE ---- */
     advance_stage(); // STAGE_BLE

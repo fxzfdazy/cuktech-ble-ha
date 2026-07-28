@@ -113,7 +113,7 @@ static void _pending_check_timeouts(void) {
         } else {
             r = (BleResult){RES_SET, false, _pending[i].piid, _pending[i].send_value, 0};
         }
-        xQueueSend(result_queue, &r, 0);
+        xQueueSend(result_queue, &r, pdMS_TO_TICKS(50));
         _pending[i].in_use = false;
     }
 }
@@ -132,7 +132,7 @@ static void _pending_match(const uint8_t *resp, size_t rl) {
             else if (vlen >= 1 && rl >= 14)
                 val = resp[13];
             BleResult r = {RES_GET, true, _pending[i].piid, val, _pending[i].poll_seq};
-            xQueueSend(result_queue, &r, 0);
+            xQueueSend(result_queue, &r, pdMS_TO_TICKS(50));
             _pending[i].in_use = false;
             return;
         }
@@ -144,7 +144,7 @@ static void _pending_match(const uint8_t *resp, size_t rl) {
             if (!_pending[i].no_result) {
                 bool piid_ok = (rl >= 8 && resp[7] == _pending[i].piid);
                 BleResult r = {RES_SET, piid_ok, _pending[i].piid, _pending[i].send_value, 0};
-                xQueueSend(result_queue, &r, 0);
+                xQueueSend(result_queue, &r, pdMS_TO_TICKS(50));
             }
             _pending[i].in_use = false;
             return;
@@ -325,13 +325,35 @@ static uint8_t _estimate_proto(uint8_t piid, float voltage, uint8_t code, uint8_
     if (piid == 1 || piid == 2) {
         // PD 关闭时端口只能输出 5V (对齐 Python state_protocol_v2.py)
         int pd_bit = (piid == 1) ? 0 : 8;
+        int pps_bit = (piid == 1) ? 1 : 9;
         bool pd_enabled = (_settings_valid[21]) ? ((_settings[21] >> pd_bit) & 1) : true;
+        bool pps_enabled = (_settings_valid[21]) ? ((_settings[21] >> pps_bit) & 1) : true;
         if (!pd_enabled && voltage > 0) return 1; // 5V
         if (code == 0x08) return 8;
-        if (code == 0x70) { float md = _min_dist(voltage); return (md <= 0.3f) ? 7 : 3; }
+        if (code == 0x70) { float md = _min_dist(voltage); return (md <= 0.05f) ? 7 : 3; }
         if (code == 0x01 || code == 0x03 || code == 0x04 || code == 0x05 ||
-            code == 0x06 || code == 0x07 || code == 0x0A || code == 0x0B || code == 0x30)
+            code == 0x06 || code == 0x07 || code == 0x0A || code == 0x0B || code == 0x30) {
+            // Get PDO kind from PIID 17. Aligned with Python state_protocol_v2.py
+            // and main.c _get_pdo_kind(). C1 kind = byte[1], C2 kind = byte[3].
+            if (_settings_valid[17]) {
+                uint16_t port_word = (piid == 1)
+                    ? (_settings[17] & 0xFFFF)
+                    : ((_settings[17] >> 16) & 0xFFFF);
+                uint8_t pdo_kind = (port_word >> 8) & 0xFF;
+                if (pdo_kind == 0x08) {  // PDO PPS
+                    if (!pps_enabled) return 7;
+                    float md = _min_dist(voltage);
+                    return (md <= 0.05f) ? 7 : 8;
+                } else if (pdo_kind == 0x07) {  // PDO PD Fixed
+                    if (pps_enabled && voltage < 12.0f)
+                        return _estimate_pd_subtype(voltage);
+                    return 7;
+                }
+            }
+            // No PDO or unknown kind
+            if (!pps_enabled) return 7;
             return _estimate_pd_subtype(voltage);
+        }
         float md = _min_dist(voltage);
         if (md <= 0.5f) return 7;
         if (voltage >= 3.0f && voltage <= 21.0f) return 8;
@@ -961,7 +983,7 @@ void ble_manager_init(const char *device_mac, const char *device_token, const ch
            &_target_addr[2], &_target_addr[1], &_target_addr[0]) != 6) {
         ESP_LOGE(TAG, "Invalid MAC: %s", device_mac);
     }
-    strncpy(_mac_str, device_mac, sizeof(_mac_str) - 1);
+    snprintf(_mac_str, sizeof(_mac_str), "%s", device_mac ? device_mac : "");
     for (int i = 0; i < 12; i++) { char hex[3] = {device_token[i*2], device_token[i*2+1], 0}; _token[i] = (uint8_t)strtol(hex, NULL, 16); }
 
     ESP_LOGI(TAG, "Init NimBLE...");
