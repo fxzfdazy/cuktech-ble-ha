@@ -115,6 +115,11 @@ static void _json_cfg(cJSON *root) {
     cJSON_AddBoolToObject(root, "bemfa_enable", _cfg->bemfa_enable);
     _mask_str(_cfg->bemfa_uid, mask, sizeof(mask));
     cJSON_AddStringToObject(root, "bemfa_uid", mask);
+    cJSON_AddStringToObject(root, "bemfa_name_c1", _cfg->bemfa_name_c1);
+    cJSON_AddStringToObject(root, "bemfa_name_c2", _cfg->bemfa_name_c2);
+    cJSON_AddStringToObject(root, "bemfa_name_c3", _cfg->bemfa_name_c3);
+    cJSON_AddStringToObject(root, "bemfa_name_a", _cfg->bemfa_name_a);
+    cJSON_AddStringToObject(root, "bemfa_name_ble", _cfg->bemfa_name_ble);
 }
 
 static int _get_config_handler(httpd_req_t *req) {
@@ -158,7 +163,36 @@ static int _post_config_handler(httpd_req_t *req) {
     SET_STR_MASKED(device_ble_key, "device_ble_key"); SET_STR(mqtt_broker, "mqtt_broker");
     SET_STR_MASKED(mqtt_user, "mqtt_user"); SET_STR_MASKED(mqtt_pass, "mqtt_pass");
     SET_STR(mqtt_topic_prefix, "mqtt_topic_prefix");
+    /* Save old bemfa names before SET_STR overwrites them */
+    char old_names[5][32];
+    strncpy(old_names[0], _cfg->bemfa_name_c1, sizeof(old_names[0]) - 1);
+    strncpy(old_names[1], _cfg->bemfa_name_c2, sizeof(old_names[1]) - 1);
+    strncpy(old_names[2], _cfg->bemfa_name_c3, sizeof(old_names[2]) - 1);
+    strncpy(old_names[3], _cfg->bemfa_name_a,  sizeof(old_names[3]) - 1);
+    strncpy(old_names[4], _cfg->bemfa_name_ble, sizeof(old_names[4]) - 1);
+    for (int i = 0; i < 5; i++) old_names[i][31] = '\0';
+
     SET_STR_MASKED(bemfa_uid, "bemfa_uid");
+    SET_STR(bemfa_name_c1, "bemfa_name_c1");
+    SET_STR(bemfa_name_c2, "bemfa_name_c2");
+    SET_STR(bemfa_name_c3, "bemfa_name_c3");
+    SET_STR(bemfa_name_a,  "bemfa_name_a");
+    SET_STR(bemfa_name_ble, "bemfa_name_ble");
+
+    /* Detect name changes → set modified flag for topic re-registration on next boot */
+    {
+        const char *n[5] = {_cfg->bemfa_name_c1, _cfg->bemfa_name_c2,
+                            _cfg->bemfa_name_c3, _cfg->bemfa_name_a,
+                            _cfg->bemfa_name_ble};
+        for (int i = 0; i < 5; i++) {
+            if (strcmp(old_names[i], n[i]) != 0) {
+                _cfg->bemfa_modified = true;
+                ESP_LOGI(TAG, "Bemfa name %d changed: \"%s\" -> \"%s\"",
+                         i, old_names[i], n[i]);
+                break;
+            }
+        }
+    }
 
     cJSON *je = cJSON_GetObjectItem(root, "mqtt_enable");
     if (je && cJSON_IsBool(je)) _cfg->mqtt_enable = cJSON_IsTrue(je);

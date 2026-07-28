@@ -519,7 +519,7 @@ static void mqtt_init(void) {
         .credentials.authentication.password = g_cfg.mqtt_pass,
         .credentials.client_id = client_id,
         .buffer.out_size = 512,
-        .task.stack_size = 4096,
+        .task.stack_size = 3072,
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -775,18 +775,23 @@ static void app_task(void* pvParameters) {
 #if ENABLE_MQTT
         // MQTT health check with exponential backoff
         if (last_mqtt_ok == 0) {
-            // Mark first "start" time after boot so the 60s timer below works
             last_mqtt_ok = now;
         }
         if (now - last_mqtt_ok > 60000) {
-            uint32_t interval = (mqtt_restart_count < 3) ? 60 : (mqtt_restart_count < 6) ? 300 : 600;
+            uint32_t interval = (mqtt_restart_count < 3) ? 180 : (mqtt_restart_count < 6) ? 300 : 600;
             if (now - last_mqtt_restart >= interval) {
-                ESP_LOGW(TAG, "MQTT no activity %lus, restarting (attempt %d)...", (unsigned long)(now - last_mqtt_ok) / 1000, mqtt_restart_count + 1);
-                esp_mqtt_client_stop(mqtt_client);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                esp_mqtt_client_start(mqtt_client);
-                last_mqtt_restart = now;
-                mqtt_restart_count++;
+                /* Skip restart if heap is too fragmented to create the MQTT task */
+                if (esp_get_free_heap_size() < 8192) {
+                    ESP_LOGW(TAG, "MQTT restart skipped — free heap %lu < 8KB", (unsigned long)esp_get_free_heap_size());
+                } else {
+                    ESP_LOGW(TAG, "MQTT no activity %lus, restarting (attempt %d)...",
+                             (unsigned long)(now - last_mqtt_ok) / 1000, mqtt_restart_count + 1);
+                    esp_mqtt_client_stop(mqtt_client);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    esp_mqtt_client_start(mqtt_client);
+                    last_mqtt_restart = now;
+                    mqtt_restart_count++;
+                }
             }
         }
         if (now - last_mqtt_ok < 60000) mqtt_restart_count = 0;
@@ -1081,7 +1086,7 @@ static void system_manager(void) {
 
     /* ---- Stage: BLE ---- */
     advance_stage(); // STAGE_BLE
-    xTaskCreatePinnedToCore(ble_task, "ble", 16384, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(ble_task, "ble", 10240, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(app_task,  "app", 8192,  NULL, 1, NULL, 0);
 
     /* ---- Stage: MQTT + Bemfa ---- */

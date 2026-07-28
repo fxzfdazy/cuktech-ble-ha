@@ -42,7 +42,7 @@ static int _disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error
 static int _disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                          const struct ble_gatt_chr *chr, void *arg);
 
-#define NOTIF_ITEM_SIZE  256
+#define NOTIF_ITEM_SIZE  64
 #define NOTIF_QUEUE_LEN  16
 
 typedef struct { uint8_t data[NOTIF_ITEM_SIZE]; size_t len; uint16_t conn_handle, attr_handle; } NotifItem;
