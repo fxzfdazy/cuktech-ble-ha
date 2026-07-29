@@ -97,6 +97,28 @@ init_idf() {
     . "$IDF_PATH/export.sh" > /dev/null 2>&1
 }
 
+# 合并 3 个 bin 为单个 firmware.bin
+# Bootloader 地址: ESP32=0x1000, 其他=0x0
+_merge_bins() {
+    local BOOT_OFFSET="0x1000"
+    [ "$TARGET" != "esp32" ] && BOOT_OFFSET="0x0"
+    echo "==> 合并为 firmware.bin..."
+    python -m esptool --chip "$TARGET" merge_bin \
+        -o build/firmware.bin \
+        "$BOOT_OFFSET" build/bootloader/bootloader.bin \
+        0x8000 build/partition_table/partition-table.bin \
+        0x10000 build/cuktech_ble.bin > /dev/null 2>&1
+}
+
+# 获取烧录参数
+_flash_params() {
+    case "$TARGET" in
+        esp32s3)   echo "qio 8MB" ;;
+        esp32c3)   echo "dio 4MB" ;;
+        *)         echo "dio 4MB" ;;
+    esac
+}
+
 cd "$DIR"
 
 case "$CMD" in
@@ -105,7 +127,8 @@ case "$CMD" in
         echo "==> 编译固件 ($TARGET)..."
         idf.py set-target "$TARGET" 2>&1 | tail -3
         idf.py build
-        echo "==> 编译完成"
+        _merge_bins
+        echo "==> 编译完成 (build/firmware.bin)"
         ;;
     flash|f)
         init_idf
@@ -120,9 +143,14 @@ case "$CMD" in
         fi
         echo "==> 编译+烧录 $TARGET 到 $PORT..."
         idf.py set-target "$TARGET" 2>&1 | tail -1
-        idf.py build 2>&1 | tail -3
-        idf.py -p "$PORT" flash
-        echo "==> 完成"
+        idf.py build
+        _merge_bins
+        read -r FLASH_MODE FLASH_SIZE <<< "$(_flash_params)"
+        python -m esptool --chip "$TARGET" -p "$PORT" -b 460800 \
+            --before default-reset --after hard-reset \
+            write-flash --flash-mode "$FLASH_MODE" --flash-size "$FLASH_SIZE" \
+            0x0 build/firmware.bin
+        echo "==> 烧录完成"
         ;;
     monitor|m)
         init_idf
@@ -135,8 +163,15 @@ case "$CMD" in
         fi
         echo "==> 编译+烧录+监控 $TARGET ($PORT)..."
         idf.py set-target "$TARGET" 2>&1 | tail -1
-        idf.py build 2>&1 | tail -3
-        idf.py -p "$PORT" flash monitor
+        idf.py build
+        _merge_bins
+        read -r FLASH_MODE FLASH_SIZE <<< "$(_flash_params)"
+        python -m esptool --chip "$TARGET" -p "$PORT" -b 460800 \
+            --before default-reset --after hard-reset \
+            write-flash --flash-mode "$FLASH_MODE" --flash-size "$FLASH_SIZE" \
+            0x0 build/firmware.bin
+        echo "==> 启动串口监控 (Ctrl+] 退出)..."
+        idf.py -p "$PORT" monitor
         ;;
     clean|c)
         init_idf

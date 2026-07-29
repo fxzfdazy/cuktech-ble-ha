@@ -648,6 +648,11 @@ static void ble_task(void *pvParameters) {
                         ESP_LOGI(TAG, "CMD_PORT: SET16=0x%02lX sent", (unsigned long)current);
                     } else {
                         ESP_LOGW(TAG, "CMD_PORT: SET16=0x%02lX FAILED", (unsigned long)current);
+                        if (!ble_manager_is_ready()) {
+                            ESP_LOGW(TAG, "BLE not connected, aborting port control");
+                            cmd.type = CMD_NOP;  // exit command drain loop
+                            break;
+                        }
                     }
                     res = (BleResult){RES_SET, true, 16, current, 0};
                     xQueueSend(result_queue, &res, 0);
@@ -673,6 +678,28 @@ static void ble_task(void *pvParameters) {
                 was_ready = ready;
                 res = (BleResult){RES_BLE_STATUS, true, 0, (uint32_t)ready, 0};
                 xQueueSend(result_queue, &res, portMAX_DELAY);
+            }
+        }
+
+        // Auto BLE reconnect with exponential backoff:
+        //  1st retry after 10s, then 20s, 40s, 80s, ... capped at 300s.
+        //  Resets to 10s when BLE reconnects successfully.
+        {
+            static uint64_t last_ble_connected = 0;
+            static unsigned backoff_sec = 10;
+            uint64_t now = esp_timer_get_time() / 1000;
+            bool ready = ble_manager_is_ready();
+            if (ready) {
+                last_ble_connected = now;
+                backoff_sec = 10;  // reset on success
+            } else if (ble_enabled && last_ble_connected > 0 &&
+                       (now - last_ble_connected >= (uint64_t)backoff_sec * 1000)) {
+                ESP_LOGI(TAG, "BLE auto-reconnect: restarting scanner (backoff=%us)...", backoff_sec);
+                last_ble_connected = now;
+                backoff_sec = (backoff_sec >= 150) ? 300 : (backoff_sec * 2);
+                ble_manager_set_enabled(false);
+                vTaskDelay(pdMS_TO_TICKS(100));  // brief settle
+                ble_manager_set_enabled(true);
             }
         }
 
@@ -722,7 +749,30 @@ static void app_task(void* pvParameters) {
             }
         }
 
-
+#if ENABLE_MQTT
+        // MQTT reconnection watchdog: if disconnected >2min since last
+        // successful publish, try reconnecting. After 3 failed attempts,
+        // force WiFi reset to purge corrupted LWIP state (the "Host is
+        // unreachable" case where WiFi is associated but TCP stack is dead).
+        if (mqtt_client && !mqtt_connected &&
+            last_mqtt_ok > 0 &&
+            (now - last_mqtt_ok > 120000) &&
+            (now - last_mqtt_restart >= 30000)) {
+            last_mqtt_restart = now;
+            mqtt_restart_count++;
+            if (mqtt_restart_count > 3) {
+                ESP_LOGW(TAG, "MQTT reconnect failed 3x, forcing WiFi reset");
+                mqtt_restart_count = 0;
+                esp_wifi_disconnect();
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                esp_wifi_connect();
+            } else {
+                ESP_LOGI(TAG, "MQTT disconnected %ds, reconnecting (%d/3)",
+                         (int)((now - last_mqtt_ok) / 1000), mqtt_restart_count);
+                esp_mqtt_client_reconnect(mqtt_client);
+            }
+        }
+#endif
 
         // Process BLE results
         BleResult res;
@@ -937,6 +987,9 @@ static void enter_ap_mode(bool net_init_done) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* Must be called after wifi_start */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_inactive_time(WIFI_IF_AP, 600));
 
     ESP_LOGI(TAG, "AP started");
 
@@ -1020,7 +1073,13 @@ static void system_manager(void) {
 
     /* ---- Stage: BLE ---- */
     advance_stage(); // STAGE_BLE
+#if CONFIG_FREERTOS_UNICORE
+    /* Single-core (ESP32-C3/H2): no core-1 to pin to */
+    xTaskCreate(ble_task, "ble", 16384, NULL, 2, NULL);
+#else
+    /* Dual-core (ESP32/S3): pin BLE to core 1 (NimBLE controller) */
     xTaskCreatePinnedToCore(ble_task, "ble", 16384, NULL, 2, NULL, 1);
+#endif
     xTaskCreatePinnedToCore(app_task,  "app", 8192,  NULL, 1, NULL, 0);
 
     /* ---- Stage: MQTT + Bemfa ---- */

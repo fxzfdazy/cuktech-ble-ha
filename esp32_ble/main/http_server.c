@@ -1,6 +1,7 @@
 #include "http_server.h"
 #include "config.h"
 #include "esp_http_server.h"
+#include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_coexist.h"
 #include "esp_log.h"
@@ -230,10 +231,12 @@ static int _post_config_handler(httpd_req_t *req) {
        Python ble_server behaviour where the frontend submits masked
        values unchanged. */
     #define SET_STR(f, k) do { cJSON *j = cJSON_GetObjectItem(root, k); \
-        if (j && cJSON_IsString(j)) strncpy(_cfg->f, cJSON_GetStringValue(j), sizeof(_cfg->f)-1); } while(0)
+        if (j && cJSON_IsString(j)) { strncpy(_cfg->f, cJSON_GetStringValue(j), sizeof(_cfg->f)-1); \
+            _cfg->f[sizeof(_cfg->f)-1] = '\0'; } } while(0)
     #define SET_STR_MASKED(f, k) do { cJSON *j = cJSON_GetObjectItem(root, k); \
         if (j && cJSON_IsString(j)) { const char *_v = cJSON_GetStringValue(j); \
-            if (!strstr(_v, "****")) strncpy(_cfg->f, _v, sizeof(_cfg->f)-1); \
+            if (!strstr(_v, "****")) { strncpy(_cfg->f, _v, sizeof(_cfg->f)-1); \
+                _cfg->f[sizeof(_cfg->f)-1] = '\0'; } \
         } \
     } while(0)
     SET_STR(wifi_ssid, "wifi_ssid"); SET_STR_MASKED(wifi_pass, "wifi_pass");
@@ -278,7 +281,7 @@ static int _post_config_handler(httpd_req_t *req) {
     if (jb && cJSON_IsBool(jb)) _cfg->bemfa_enable = cJSON_IsTrue(jb);
     cJSON *jp = cJSON_GetObjectItem(root, "mqtt_port");
     if (jp && cJSON_IsNumber(jp)) _cfg->mqtt_port = (uint16_t)cJSON_GetNumberValue(jp);
-    _cfg->valid = (_cfg->wifi_ssid[0] != '\0');
+    _cfg->valid = (_cfg->wifi_ssid[0] != '\0' && _cfg->wifi_pass[0] != '\0');
 
     ESP_LOGI(TAG, "Config saved: wifi=%s mqtt=%s:%d", _cfg->wifi_ssid, _cfg->mqtt_broker, _cfg->mqtt_port);
     config_store_save(_cfg);
@@ -596,7 +599,18 @@ static void _serve_embedded(httpd_req_t *req, const EmbeddedFile *f) {
 /* All page/static handlers: always return 0 (never -1) so HTTP server
    doesn't send 500. If send fails, the connection is already dead. */
 static int _get_dash_handler(httpd_req_t *req) {
-    const EmbeddedFile *f = _find_embedded("/phone.html");
+    // 判断当前模式: AP 配网中(无 STA IP) → config.html, 正常运行(有 STA IP) → phone.html
+    bool is_config = true;
+    if (_cfg && _cfg->valid) {
+        esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (sta) {
+            esp_netif_ip_info_t ip;
+            if (esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0)
+                is_config = false;
+        }
+    }
+    const char *target = is_config ? "/config.html" : "/phone.html";
+    const EmbeddedFile *f = _find_embedded(target);
     if (f) { _serve_embedded(req, f); return 0; }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"embedded_file_not_found\"}");
