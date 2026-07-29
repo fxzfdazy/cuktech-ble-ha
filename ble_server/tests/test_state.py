@@ -309,14 +309,14 @@ class TestEstimateProtocolHw:
     def test_hw_protocol_overrides_heuristic(self):
         """When hw_protocol is provided, it should be used directly."""
         from state_protocol_v2 import estimate_protocol_number, RawPortData
-        raw = RawPortData(in_use=True, code=0x04, current_raw=8, voltage_raw=200)
+        raw = RawPortData(in_use=True, status_raw=0x01, code=0x04, current_raw=8, voltage_raw=200)
         result = estimate_protocol_number(2, raw, hw_protocol=4)
         assert result == 4  # AFC, not PD
 
     def test_hw_protocol_none_falls_back(self):
         """When hw_protocol is None, heuristic should run."""
         from state_protocol_v2 import estimate_protocol_number, RawPortData
-        raw = RawPortData(in_use=True, code=0x07, current_raw=5, voltage_raw=200)
+        raw = RawPortData(in_use=True, status_raw=0x01, code=0x07, current_raw=5, voltage_raw=200)
         result = estimate_protocol_number(2, raw, hw_protocol=None)
         assert result == 7  # PD via heuristic
 

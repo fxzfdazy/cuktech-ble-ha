@@ -97,6 +97,7 @@ def get_port_type(piid: int) -> PortType:
 class RawPortData:
     """从 BLE 解密后的原始端口数据."""
     in_use: bool
+    status_raw: int     # 原始 status 字节 (0x00=空闲, 0x01=单口, 0x11=C3+A合并)
     code: int           # 原始 code 字节 (非米家协议号)
     current_raw: int    # 原始电流 (×10 mA)
     voltage_raw: int    # 原始电压 (×10 mV)
@@ -121,6 +122,7 @@ class RawPortData:
         b = payload[-4:]
         return cls(
             in_use=bool(b[0]),
+            status_raw=b[0],
             code=b[1],
             current_raw=b[2],
             voltage_raw=b[3],
@@ -348,6 +350,7 @@ def decode_port_v2(
         "current": round(raw.current, 1),
         "power": raw.power,
         "active": is_active,
+        "status_raw": raw.status_raw,
         "protocol": protocol,
         "_confidence": confidence,
         "_detection_method": method,

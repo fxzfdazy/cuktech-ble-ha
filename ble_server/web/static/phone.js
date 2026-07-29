@@ -90,6 +90,7 @@ async function fetchStatus() {
                     state.ports[key].w = port.power || 0;
                     if (!isRecentLocal()) state.ports[key].enabled = port.enabled !== false;
                     state.ports[key].protocol = port.protocol || 'idle';
+                    state.ports[key].status_raw = port.status_raw;
                 }
             }
         }
@@ -272,23 +273,33 @@ function renderRateCard() {
     }
     document.getElementById('totalPowerNum').textContent = totalW.toFixed(1);
 
+    // Check if C3+USB-A merged (0x11 = merged mode)
+    const isMerged = state.ports.c3?.status_raw === 0x11;
+
     // Port power rows above each chart
     for (const key of PORT_KEYS) {
+        const row = document.getElementById('portPower' + key.toUpperCase() + 'Row');
+        if (!row) continue;
+
+        if (key === 'a' && isMerged) {
+            row.style.display = 'none';
+            continue;
+        }
+        row.style.display = '';
+
         const p = state.ports[key];
         const enabled = state.ports[key].enabled;
         const w = enabled ? p.w : 0;
         const status = enabled && w > 0 ? w.toFixed(1) : '--';
         const protocol = enabled && p.protocol ? p.protocol : '';
-        const row = document.getElementById('portPower' + key.toUpperCase() + 'Row');
-        if (row) {
-            row.innerHTML = `<div class="port-power-row" style="margin-bottom:2px;">
-                <div class="port-power-dot" style="background:${PORT_COLORS[key]}"></div>
-                <span class="port-power-name">${PORT_NAMES[key]}</span>
-                <span class="port-power-w">${status}</span>
-                <span class="port-power-w-unit">W</span>
-                <span class="port-power-protocol">${protocol}</span>
-            </div>`;
-        }
+        const name = (key === 'c3' && isMerged) ? 'C3&A' : PORT_NAMES[key];
+        row.innerHTML = `<div class="port-power-row" style="margin-bottom:2px;">
+            <div class="port-power-dot" style="background:${PORT_COLORS[key]}"></div>
+            <span class="port-power-name">${name}</span>
+            <span class="port-power-w">${status}</span>
+            <span class="port-power-w-unit">W</span>
+            <span class="port-power-protocol">${protocol}</span>
+        </div>`;
     }
 }
 
@@ -662,6 +673,7 @@ function applyFullStatus(data) {
                 state.ports[key].w = port.power || 0;
                 if (!isRecentLocal()) state.ports[key].enabled = port.enabled !== false;
                 state.ports[key].protocol = port.protocol || 'idle';
+                state.ports[key].status_raw = port.status_raw;
             }
         }
     }
@@ -680,6 +692,7 @@ function applyPortUpdate(portId, portData) {
     state.ports[key].w = portData.power || 0;
     if (!isRecentLocal()) state.ports[key].enabled = portData.enabled !== false;
     state.ports[key].protocol = portData.protocol || 'idle';
+    state.ports[key].status_raw = portData.status_raw;
     // Incremental render — skip chart (decoupled to 2s timer)
     renderDeviceArea();
     renderRateCard();
