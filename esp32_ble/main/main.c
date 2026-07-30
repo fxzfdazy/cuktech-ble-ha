@@ -84,6 +84,7 @@ static uint32_t port_ctrl_val = 0xFF;  // assume all ports on (can't GET to read
 static bool port_ctrl_valid = true;    // track SET updates
 static bool ble_enabled = true;        // BLE connection enable/disable switch
 static bool ble_ready_flag = false;
+static int mqtt_restart_count = 0;     // MQTT reconnect failure counter (shared with event handler)
 static uint64_t last_set16_time = 0;
 static uint64_t last_set_time = 0;   // any SET command (used for push/GET debounce during transitions)
 static uint8_t last_set_piid = 0;    // piid of last SET — distinguish port control from protocol change
@@ -349,6 +350,8 @@ static void mqtt_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT connected");
         mqtt_connected = true;
+        last_mqtt_ok = esp_timer_get_time() / 1000;
+        mqtt_restart_count = 0;  /* reset reconnection watchdog */
         esp_mqtt_client_subscribe(mqtt_client, _topic_set, 1);
         esp_mqtt_client_subscribe(mqtt_client, _topic_port_cmd, 1);
         esp_mqtt_client_subscribe(mqtt_client, _topic_ble, 1);
@@ -548,9 +551,12 @@ static void wifi_reconnect_task(void *arg) {
 // ============================================================
 
 static void on_ble_state_change(BLEState old_state, BLEState new_state) {
-    // Notify app_task immediately on state changes (especially disconnect)
+    // Notify app_task immediately on state changes (especially disconnect).
+    // Use a short timeout to avoid deadlocking ble_task if app_task is stuck.
     BleResult res = {RES_BLE_STATUS, true, 0, (uint32_t)(new_state == BLE_READY), 0};
-    xQueueSend(result_queue, &res, portMAX_DELAY);
+    if (xQueueSend(result_queue, &res, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGW(TAG, "BLE state change dropped (queue full)");
+    }
 }
 
 // Port data callback unused — _parse_port sends RES_PORT_PUSH directly
@@ -590,8 +596,11 @@ static void ble_task(void *pvParameters) {
     // Internal poll is disabled to prevent pending table overflow.
 
     while (1) {
-        // Drain urgent queue (CMD_PORT from MQTT) and cmd_queue (rare external GETs)
+        // Drain urgent queue (CMD_PORT from MQTT) and cmd_queue (rare external GETs).
+        // Limit to 8 commands per iteration to bound time between ble_manager_loop()
+        // (needed for keepalive and notification processing).
         bool did_work = false;
+        int drain_cnt = 0;
         do {
             cmd.type = CMD_NOP;
             if (urgent_queue && xQueueReceive(urgent_queue, &cmd, 0) == pdTRUE) {
@@ -600,6 +609,7 @@ static void ble_task(void *pvParameters) {
                 did_work = true;
             }
             if (cmd.type != CMD_NOP) {
+                drain_cnt++;
                 switch (cmd.type) {
                 case CMD_GET: {
                     uint32_t val = 0;
@@ -667,7 +677,7 @@ static void ble_task(void *pvParameters) {
                 default: break;
                 }
             }
-        } while (cmd.type != CMD_NOP);
+        } while (cmd.type != CMD_NOP && drain_cnt < 8);
 
         // BLE state machine & response processing
         ble_manager_loop();
@@ -699,7 +709,13 @@ static void ble_task(void *pvParameters) {
                 last_ble_connected = now;
                 backoff_sec = (backoff_sec >= 150) ? 300 : (backoff_sec * 2);
                 ble_manager_set_enabled(false);
-                vTaskDelay(pdMS_TO_TICKS(100));  // brief settle
+                /* Wait for disconnect to fully settle before re-enabling
+                   (avoid racing with in-flight GAP disconnect event). */
+                uint32_t settle_ms = 500;
+                do {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    settle_ms -= 50;
+                } while (!ble_manager_is_idle() && settle_ms > 0);
                 ble_manager_set_enabled(true);
             }
         }
@@ -720,7 +736,6 @@ static void app_task(void* pvParameters) {
     uint64_t last_cd_fetch_slow = 0;
     uint64_t last_cd_fetch_fast = 0;
     uint64_t last_mqtt_restart = 0;
-    int mqtt_restart_count = 0;
 
     while (1) {
         uint64_t now = esp_timer_get_time() / 1000;
@@ -730,10 +745,17 @@ static void app_task(void* pvParameters) {
             last_mem_print = now;
             size_t _free = esp_get_free_heap_size();
             size_t _largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-            ESP_LOGI(TAG, "MEM: free=%u min=%u max_block=%u",
+            /* Stack watermarks: < 512 bytes remaining → risk of overflow */
+            UBaseType_t app_hwm  = uxTaskGetStackHighWaterMark(NULL); /* own task */
+            unsigned app_pct = (unsigned)((app_hwm * 100) / 8192);
+            ESP_LOGI(TAG, "MEM: free=%u min=%u max_block=%u | stack: app=%u/%u (%u%%)",
                      (unsigned)_free,
                      (unsigned)esp_get_minimum_free_heap_size(),
-                     (unsigned)_largest);
+                     (unsigned)_largest,
+                     (unsigned)app_hwm, 8192, app_pct);
+            if (app_hwm < 1024) {
+                ESP_LOGW(TAG, "APP task stack low: %u bytes remaining!", (unsigned)app_hwm);
+            }
             if (_largest < _free / 2) {
                 ESP_LOGW(TAG, "Fragmentation: max_block=%u < free/2 (%u) — triggering GC",
                          (unsigned)_largest, (unsigned)_free / 2);
@@ -932,9 +954,13 @@ static void app_task(void* pvParameters) {
 
         // Status print every 10s
         if (now - last_status_print >= 10000) {
-            ESP_LOGI(TAG, "Status: BLE=%s Uptime=%ds",
+            int pending = ble_manager_pending_count();
+            wifi_ap_record_t ap_info;
+            int rssi = -100;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) rssi = ap_info.rssi;
+            ESP_LOGI(TAG, "Status: BLE=%s pend=%d WiFi=%ddBm Uptime=%ds",
                      ble_ready_flag ? "CONNECTED" : "DISCONNECTED",
-                     (int)(now / 1000));
+                     pending, rssi, (int)(now / 1000));
             last_status_print = now;
         }
 
@@ -983,6 +1009,7 @@ static void enter_ap_mode(bool net_init_done) {
             .password = AP_PASSWORD,
             .max_connection = 4,
             .authmode = WIFI_AUTH_WPA2_PSK,
+            .channel = 6,  // 避开最拥挤的 channel 1
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
