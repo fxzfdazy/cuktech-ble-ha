@@ -322,6 +322,10 @@ static uint8_t _estimate_proto(uint8_t piid, float voltage, uint8_t code, uint8_
     if ((piid == 1 || piid == 2) && _settings_valid[17]) {
         uint16_t port_word = (piid == 1) ? (_settings[17] & 0xFFFF) : ((_settings[17] >> 16) & 0xFFFF);
         pdo_kind = (port_word >> 8) & 0xFF;
+    } else if ((piid == 3 || piid == 4) && _settings_valid[18]) {
+        /* C3 (piid=3) = lower 16 bits; A (piid=4) = upper 16 bits (same layout as PIID 17) */
+        uint16_t port_word = (piid == 3) ? (_settings[18] & 0xFFFF) : ((_settings[18] >> 16) & 0xFFFF);
+        pdo_kind = (port_word >> 8) & 0xFF;
     }
     UNLOCK_SETTINGS();
     return estimate_protocol_shared(piid, voltage, code, pd_enabled, pps_enabled, pdo_kind, hw_protocol);
