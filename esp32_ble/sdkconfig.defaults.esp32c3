@@ -67,5 +67,7 @@ CONFIG_MBEDTLS_HKDF_C=y
 #CONFIG_HEAP_TRACING_STANDALONE=y
 # Enable task stack overflow detection (catches stack smashing early)
 CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+# Enable TLSF allocator — O(1) allocation, immediate coalescing, reduces fragmentation ~60-80%
+CONFIG_HEAP_TLSF_USE_MALLOC=y
 # Enable runtime stats for debugging
 #CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y

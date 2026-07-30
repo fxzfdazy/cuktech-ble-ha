@@ -742,23 +742,25 @@ static void app_task(void* pvParameters) {
 
         // Memory monitor + GC every 10 seconds
         if (now - last_mem_print >= 10000) {
+            static uint8_t _frag_warn_count = 0;
             last_mem_print = now;
             size_t _free = esp_get_free_heap_size();
             size_t _largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
             /* Stack watermarks: < 512 bytes remaining → risk of overflow */
             UBaseType_t app_hwm  = uxTaskGetStackHighWaterMark(NULL); /* own task */
-            unsigned app_pct = (unsigned)((app_hwm * 100) / 8192);
+            unsigned app_pct = (unsigned)((app_hwm * 100) / 7168);
             ESP_LOGI(TAG, "MEM: free=%u min=%u max_block=%u | stack: app=%u/%u (%u%%)",
                      (unsigned)_free,
                      (unsigned)esp_get_minimum_free_heap_size(),
                      (unsigned)_largest,
-                     (unsigned)app_hwm, 8192, app_pct);
+                     (unsigned)app_hwm, 7168, app_pct);
             if (app_hwm < 1024) {
                 ESP_LOGW(TAG, "APP task stack low: %u bytes remaining!", (unsigned)app_hwm);
             }
             if (_largest < _free / 2) {
-                ESP_LOGW(TAG, "Fragmentation: max_block=%u < free/2 (%u) — triggering GC",
-                         (unsigned)_largest, (unsigned)_free / 2);
+                _frag_warn_count++;
+                ESP_LOGW(TAG, "Fragmentation [%d]: max_block=%u < free/2 (%u) — triggering GC",
+                         _frag_warn_count, (unsigned)_largest, (unsigned)_free / 2);
                 /* Active GC: reset cJSON pool, log detailed caps breakdown */
                 size_t pool_peak = http_server_pool_gc();
                 multi_heap_info_t info;
@@ -769,6 +771,15 @@ static void app_task(void* pvParameters) {
                          (unsigned)info.minimum_free_bytes,
                          (unsigned)info.largest_free_block,
                          (unsigned)info.total_allocated_bytes);
+                /* If fragmentation persists for >5 min (30×10s intervals),
+                   reset the chip to recover a clean heap. */
+                if (_frag_warn_count >= 30) {
+                    ESP_LOGE(TAG, "Fragmentation persisted 5+ min — rebooting to recover heap");
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    esp_restart();
+                }
+            } else {
+                _frag_warn_count = 0;  /* fragmentation resolved */
             }
         }
 
@@ -983,7 +994,7 @@ static void _reboot_task(void *arg) {
 
 static void ap_reboot_callback(void) {
     ESP_LOGI(TAG, "Config saved, scheduling reboot in 3s...");
-    xTaskCreate(_reboot_task, "reboot", 2048, NULL, 1, NULL);
+    xTaskCreate(_reboot_task, "reboot", 1024, NULL, 1, NULL);
 }
 
 static void enter_ap_mode(bool net_init_done) {
@@ -1074,7 +1085,7 @@ static void system_manager(void) {
         return;
     }
     /* Start reconnect task only AFTER first successful connection */
-    xTaskCreatePinnedToCore(wifi_reconnect_task, "wifi_reconn", 3072, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(wifi_reconnect_task, "wifi_reconn", 2048, NULL, 3, NULL, 0);
 
     /* ---- Stage: HTTP ---- */
     advance_stage(); // STAGE_HTTP
@@ -1108,7 +1119,7 @@ static void system_manager(void) {
     /* Dual-core (ESP32/S3): pin BLE to core 1 (NimBLE controller) */
     xTaskCreatePinnedToCore(ble_task, "ble", 16384, NULL, 2, NULL, 1);
 #endif
-    xTaskCreatePinnedToCore(app_task,  "app", 8192,  NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(app_task,  "app", 7168,  NULL, 1, NULL, 0);
 
     /* ---- Stage: MQTT + Bemfa ---- */
     advance_stage(); // STAGE_MQTT
