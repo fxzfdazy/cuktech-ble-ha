@@ -155,8 +155,9 @@ class ChargerState:
 
     async def update_port(self, piid: int, data: dict):
         async with self._lock:
-            # 过滤掉 V2 内部调试字段（以 _ 开头），只保留 PortState 需要的字段
-            clean_data = {k: v for k, v in data.items() if not k.startswith('_')}
+            # 过滤掉 V2 内部调试字段（以 _ 开头）和透传字段（非 PortState 字段）
+            _skip = {'status_raw'}
+            clean_data = {k: v for k, v in data.items() if not k.startswith('_') and k not in _skip}
             try:
                 self.ports[piid] = PortState(**clean_data)
             except TypeError as e:
