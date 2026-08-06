@@ -219,6 +219,9 @@
                 <div class="power-item"><div class="power-value warning" id="modalPower">0.0</div><div class="power-label">功率 (W)</div></div>
                 <div class="power-item"><div class="power-value" id="modalProtocol">idle</div><div class="power-label">实时充电协议</div></div>
             </div>
+            <div style="display:flex;justify-content:flex-end;gap:4px;margin:4px 0;">
+                <button class="time-btn" id="modalRealTimeBtn" onclick="toggleModalRealTime()" style="font-size:10px;padding:2px 8px;">⚡ 实时</button>
+            </div>
             <div class="modal-chart-container"><canvas id="modalChart"></canvas></div>
             <div class="modal-protocols" id="modalProtocols"></div>
         </div>

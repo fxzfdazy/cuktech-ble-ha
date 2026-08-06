@@ -35,7 +35,7 @@ class TestReconnectDelay:
         assert delay == 32  # After reset, next delay would be 1
 
     def test_ble_manager_reconnect_delay(self):
-        """Test BLEManager._get_reconnect_delay() returns correct values."""
+        """Test BLEManager._get_reconnect_delay() returns correct values (with jitter)."""
         from unittest.mock import MagicMock
         from ble_manager import BLEManager
 
@@ -45,14 +45,21 @@ class TestReconnectDelay:
         config.server.reconnect_max_delay = 300.0
         mgr = BLEManager(mac="AA:BB:CC:DD:EE:FF", token="aabbccddeeff", state=state, config=config)
 
+        # No jitter for delay <= 1.0
         mgr._reconnect_attempts = 0
         assert mgr._get_reconnect_delay() == 1.0
 
+        # Jitter range for delay=8.0: ±25% = ±2.0 → [6.0, 10.0]
         mgr._reconnect_attempts = 3
-        assert mgr._get_reconnect_delay() == 8.0
+        for _ in range(20):
+            delay = mgr._get_reconnect_delay()
+            assert 6.0 <= delay <= 10.0, f"delay {delay} outside range"
 
+        # Jitter range for delay=300.0: ±25% = ±75 → [225, 375]
         mgr._reconnect_attempts = 10
-        assert mgr._get_reconnect_delay() == 300.0
+        for _ in range(20):
+            delay = mgr._get_reconnect_delay()
+            assert 225 <= delay <= 375, f"delay {delay} outside range"
 
 
 class TestControllerInit:

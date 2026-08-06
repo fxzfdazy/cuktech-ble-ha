@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.9] - 2026-07-30
+
+### Added
+- `CuktechBaseEntity` base class unifying entity lifecycle across 11 entity classes
+- Fine-grained callbacks: port/settings-specific notification replaces full broadcast
+
+### Changed
+- Coordinator: extracted shared device-info/BLE state sync methods, eliminating duplicate logic between MQTT status and HTTP health check paths
+- Entity classes migrated to `CuktechBaseEntity`, eliminating ~150 lines of duplicate code
+- `CuktechConnectionSwitch.available` no longer blocked by `ble_pending`
+- `TotalPowerSensor` uses `PORT_MAP.values()` instead of hardcoded keys
+
+### Fixed
+- Event entity: redundant `async_write_ha_state` after `_trigger_event`
+- ConfigFlow: removed dead `except ValueError: raise` stub
+
 ## [1.0.8] - 2026-07-25
 
 ### Changed

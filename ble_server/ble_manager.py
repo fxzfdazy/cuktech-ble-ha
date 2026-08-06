@@ -3,6 +3,8 @@ import asyncio
 import logging
 import sys
 import os
+import random
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -38,13 +40,19 @@ def _has_bluetoothctl():
 
 
 class BLEManager:
+    # ── Concurrency & recovery limits ──
+    CMD_QUEUE_MAXSIZE = 500      # prevent unbounded command growth
+    RECONNECT_JITTER = 0.25      # ±25% jitter on reconnect delays
+    CIRCUIT_BREAKER_MAX_FAIL = 20  # consecutive failures before cooling off
+    CIRCUIT_BREAKER_COOLDOWN = 300  # 5 minutes
+
     def __init__(self, mac, token, state, config):
         self.mac = mac
         self.token = bytes.fromhex(token)
         self.state = state
         self.config = config
         self.ctrl = None
-        self.cmd_queue = asyncio.Queue()
+        self.cmd_queue = asyncio.Queue(maxsize=self.CMD_QUEUE_MAXSIZE)
         self._stop_event = asyncio.Event()
         self._port_timer_task = None
         self._mqtt_publish = None
@@ -61,6 +69,9 @@ class BLEManager:
         self._base_reconnect_delay = config.server.reconnect_base_delay
         self._max_reconnect_delay = config.server.reconnect_max_delay
         self._history = None
+        self._sess_lock = threading.Lock()  # protects _active_sessions (accessed only from event loop)
+        self._circuit_breaker_cooldown = 0.0
+        self._circuit_breaker_failures = 0
         # Energy tracking
         from energy import AdaptiveEnergyIntegrator, PortEnergyState, ChargeEndDetector
         self._energy_integrator = AdaptiveEnergyIntegrator()
@@ -73,6 +84,11 @@ class BLEManager:
         # Session end debounce: consecutive low-current count per port
         self._low_current_count = {i: 0 for i in range(1, 5)}
         self._LOW_CURRENT_N = 300  # consecutive readings below threshold to end session
+        # Idle port verification: when a port stops receiving BLE pushes, actively
+        # GET it after IDLE_VERIFY_SEC to detect unplug (V/I stuck at last value).
+        self._IDLE_VERIFY_SEC = 15          # idle > 15s → trigger one active GET
+        self._last_verify_time = {i: 0.0 for i in range(1, 5)}
+        self._pending_verify = set()        # ports queued for verify (avoids duplicate enqueue)
 
     def set_mqtt_publisher(self, publisher):
         self._mqtt_publish = publisher
@@ -85,7 +101,7 @@ class BLEManager:
         self._quality_provider = provider
 
     def _sse_emit(self, event_type, data):
-        """Emit SSE event if emitter is connected."""
+        """Emit SSE event if emitter is connected. Sync — emitter uses threading.Lock internally."""
         if self._sse_emitter:
             self._sse_emitter.emit(event_type, data)
 
@@ -157,8 +173,11 @@ class BLEManager:
         """Gracefully close all active charge sessions on shutdown."""
         now = time.time()
         for port, es in self._energy_states.items():
-            if es.is_charging and port in self._active_sessions and self._history:
-                sid = self._active_sessions.pop(port)
+            if es.is_charging:
+                with self._sess_lock:
+                    sid = self._active_sessions.pop(port, None)
+                if not sid or not self._history:
+                    continue
                 duration = int(now - (es.session_start or now))
                 det = self._charge_detectors[port]
                 det.on_session_end(now)
@@ -175,12 +194,12 @@ class BLEManager:
 
     def _close_session(self, piid, timestamp, voltage=0, current=0):
         """Close a charge session: cleanup state and write to DB.
-        Synchronous — no await, safe to call from any non-async context.
         Returns sid if a session was closed, None otherwise.
         """
         det = self._charge_detectors[piid]
         es = self._energy_states[piid]
-        sid = self._active_sessions.pop(piid, None)
+        with self._sess_lock:
+            sid = self._active_sessions.pop(piid, None)
         if not sid:
             return None
         det.on_session_end(timestamp)
@@ -246,12 +265,37 @@ class BLEManager:
             _LOGGER.error("Failed to publish charge event: %s", err)
 
     def _get_reconnect_delay(self):
-        """Calculate exponential backoff delay."""
+        """Calculate exponential backoff delay with jitter."""
         delay = min(
             self._base_reconnect_delay * (2 ** min(self._reconnect_attempts, 10)),
             self._max_reconnect_delay
         )
-        return delay
+        # Add jitter (±25%) to prevent thundering herd
+        if delay > 1.0:
+            jitter = delay * self.RECONNECT_JITTER * (random.random() * 2 - 1)
+            delay += jitter
+        return max(0.5, delay)
+
+    def _check_circuit_breaker(self) -> bool:
+        """Return True if the circuit breaker is open (should NOT connect)."""
+        now = time.time()
+        if self._circuit_breaker_cooldown > 0:
+            if now < self._circuit_breaker_cooldown:
+                return True
+            # Cooldown expired
+            self._circuit_breaker_cooldown = 0.0
+            self._circuit_breaker_failures = 0
+        return False
+
+    def _record_circuit_breaker_failure(self):
+        """Record a failure; trip circuit breaker if threshold reached."""
+        self._circuit_breaker_failures += 1
+        if self._circuit_breaker_failures >= self.CIRCUIT_BREAKER_MAX_FAIL:
+            _LOGGER.warning(
+                "Circuit breaker tripped (%d failures), cooling off for %ds",
+                self._circuit_breaker_failures, self.CIRCUIT_BREAKER_COOLDOWN,
+            )
+            self._circuit_breaker_cooldown = time.time() + self.CIRCUIT_BREAKER_COOLDOWN
 
     async def start(self):
         self._stop_event.clear()
@@ -261,20 +305,41 @@ class BLEManager:
         first_run = True
         last_error = None
         while not self._stop_event.is_set():
+            # Check circuit breaker before attempting connection
+            if self._check_circuit_breaker():
+                remaining = int(self._circuit_breaker_cooldown - time.time())
+                _LOGGER.warning(
+                    "Circuit breaker open, waiting %ds before next attempt",
+                    max(remaining, 0),
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=max(remaining, 30),
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
             try:
                 await self._connect_and_run()
                 self._reconnect_attempts = 0
                 self._decrypt_failures = 0
                 self._auth_fail_count = 0
+                self._circuit_breaker_failures = 0
                 first_run = False
                 last_error = None
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 last_error = e
+                self._record_circuit_breaker_failure()
                 err_str = str(e)
                 if 'POWERED_OFF' in err_str or 'No powered Bluetooth' in err_str:
                     _LOGGER.warning("Bluetooth is powered off, will retry in 60s...")
+                elif 'Charger not found' in err_str or 'BLE scan failed' in err_str:
+                    # 可恢复的扫描错误，不需要完整堆栈
+                    _LOGGER.warning("BLE loop error: %s (retry %d)", e, self._reconnect_attempts + 1)
                 else:
                     _LOGGER.error("BLE loop error: %s", e, exc_info=True)
             finally:
@@ -303,6 +368,9 @@ class BLEManager:
                                     self._auth_fail_count, delay)
                 elif last_error and ('POWERED_OFF' in str(last_error) or 'No powered Bluetooth' in str(last_error)):
                     delay = 60  # Bluetooth powered off, check less frequently
+                elif last_error and 'Charger not found' in str(last_error):
+                    # 充电器不在范围内: 不需要 power cycle 适配器，只重试扫描
+                    delay = self._get_reconnect_delay()
                 elif last_error:
                     await self._force_disconnect_bluetooth()
                     delay = self._get_reconnect_delay()
@@ -313,7 +381,9 @@ class BLEManager:
                 # Prune to last 10 minutes
                 cutoff = time.time() - 600
                 self._reconnect_times = [t for t in self._reconnect_times if t > cutoff]
-                if 'POWERED_OFF' not in str(last_error or '') and 'No powered Bluetooth' not in str(last_error or ''):
+                if 'Charger not found' in str(last_error or ''):
+                    _LOGGER.info("Waiting %.0fs before retry (attempt %d)...", delay, self._reconnect_attempts)
+                elif 'POWERED_OFF' not in str(last_error or '') and 'No powered Bluetooth' not in str(last_error or ''):
                     _LOGGER.info("Reconnecting in %.0fs (attempt %d)...", delay, self._reconnect_attempts)
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
@@ -344,15 +414,23 @@ class BLEManager:
 
     async def _connect(self):
         _LOGGER.info("Scanning for charger...")
+
+        # 先清理 BlueZ 残留扫描状态（避免 InProgress 错误）
+        await self._stop_ble_scan()
+
         from bleak import BleakScanner
         try:
             found = await BleakScanner.find_device_by_address(
                 self.mac, timeout=self.config.ble.scan_timeout)
         except Exception as e:
+            err_str = str(e)
             _LOGGER.error("BLE scan failed: %s", e)
+            # InProgress 错误 → 适配器状态异常，需要 power cycle
+            if 'InProgress' in err_str:
+                await self._force_disconnect_bluetooth()
             raise ConnectionError(f"BLE scan failed: {e}")
         if not found:
-            _LOGGER.error("Charger not found with MAC: %s", self.mac)
+            _LOGGER.warning("Charger not found with MAC: %s (will retry)", self.mac)
             raise ConnectionError("Charger not found")
 
         self.ctrl = CuktechBLEController(self.mac, self.token)
@@ -384,6 +462,9 @@ class BLEManager:
         await self.state.set_connection(True, True)
         _invalidate()
         _LOGGER.info("Authenticated!")
+
+        # 立即推送连接状态，前端无需等待 15 个 PIID 读完
+        self._publish_status({"connected": True, "authenticated": True}, retain=True)
 
         # 先读取 PIID 17 (c1_c2_protocol) 获取硬件协议代码
         # 再处理 init_push 端口数据，确保 hw_protocol 已就绪
@@ -454,6 +535,22 @@ class BLEManager:
         # bluetoothctl disconnect MAC 由 _force_disconnect_bluetooth() 统一处理
         # 此处不再重复调用，避免设备收到多次断连通知导致状态混乱
 
+    async def _stop_ble_scan(self):
+        """Cancel any lingering BLE scan on the adapter before starting a new one.
+        Prevents [org.bluez.Error.InProgress] Operation already in progress.
+        """
+        if not _has_bluetoothctl():
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bluetoothctl", "scan", "off",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+        except Exception:
+            pass
+
     async def _force_disconnect_bluetooth(self):
         """使用 bluetoothctl 强制断开蓝牙连接并重置适配器。
 
@@ -463,6 +560,8 @@ class BLEManager:
         if not _has_bluetoothctl():
             _LOGGER.info("bluetoothctl not available, skipping adapter power cycle")
             return
+        # 先停止残留扫描，再断开已有连接，最后重置适配器
+        await self._stop_ble_scan()
         try:
             proc = await asyncio.create_subprocess_exec(
                 "bluetoothctl", "disconnect", self.mac,
@@ -471,8 +570,7 @@ class BLEManager:
             )
             await asyncio.wait_for(proc.communicate(), timeout=5)
             # 等待 BLE Link Layer disconnect 完成
-            await asyncio.sleep(3)
-            _LOGGER.info("BLE disconnect confirmed")
+            await asyncio.sleep(1)
         except Exception as e:
             _LOGGER.warning("bluetoothctl disconnect failed: %s", e)
         # 重置蓝牙适配器以清理残留状态
@@ -613,6 +711,21 @@ class BLEManager:
                 es = self._energy_states[piid]
                 # BLE handler already recorded if last_time < 2s ago
                 idle = es.last_time is None or (now - es.last_time > 2)
+                # Active verification: if the port has been idle (no BLE push)
+                # longer than IDLE_VERIFY_SEC, enqueue a GET so the main loop
+                # actively re-samples it. This catches the case where the unplug
+                # push was lost (we were busy in an active GET) and ps stays at
+                # the stale pre-unplug V/I forever.
+                if (idle and es.last_time is not None
+                        and now - es.last_time > self._IDLE_VERIFY_SEC
+                        and now - self._last_verify_time[piid] > self._IDLE_VERIFY_SEC
+                        and piid not in self._pending_verify):
+                    self._pending_verify.add(piid)
+                    try:
+                        self.cmd_queue.put_nowait(("verify_port", piid, None))
+                        self._last_verify_time[piid] = now
+                    except asyncio.QueueFull:
+                        self._pending_verify.discard(piid)
                 if idle:
                     # Only integrate if current > 0 (no power transfer at 0A)
                     if es.is_charging and ps.current > 0:
@@ -661,7 +774,7 @@ class BLEManager:
                         c1_proto = (val32 >> 24) & 0xFF
                         c2_proto = (val32 >> 8) & 0xFF
                         # 零值保护在 state 层自动处理
-                        self.state.set_hw_protocol_codes(c1_proto, c2_proto)
+                        await self.state.set_hw_protocol_codes(c1_proto, c2_proto)
                         _LOGGER.info("PIID17 hw_protocol_codes: C1=%d C2=%d (raw=0x%08X)",
                                      self.state._hw_protocol_c1, self.state._hw_protocol_c2, val32)
                     elif piid == 18:
@@ -670,13 +783,13 @@ class BLEManager:
                         val32 = result["value"] & 0xFFFFFFFF
                         c3_proto = (val32 >> 24) & 0xFF
                         a_proto = (val32 >> 8) & 0xFF
-                        self.state.set_hw_protocol_codes_c3a(c3_proto, a_proto)
+                        await self.state.set_hw_protocol_codes_c3a(c3_proto, a_proto)
                         _LOGGER.info("PIID18 hw_protocol_codes: C3=%d A=%d (raw=0x%08X)",
                                      self.state._hw_protocol_c3, self.state._hw_protocol_a, val32)
                     elif piid == 21:
                         await self.state.update_protocol_extend(result["value"])
                         self._sse_emit("protocol", {"switches": self.state.protocol_switches,
-                                                     "protocol_extend": result["value"]})
+                                                    "protocol_extend": result["value"]})
             except Exception as e:
                 fail_count += 1
                 _LOGGER.debug("Failed to read PIID %d: %s", piid, e)
@@ -753,6 +866,8 @@ class BLEManager:
                     await self._handle_set_command(cmd_data, cmd_future)
                 elif cmd_type == "port":
                     await self._handle_port_command(cmd_data, cmd_future)
+                elif cmd_type == "verify_port":
+                    await self._handle_verify_port(cmd_data, cmd_future)
 
             except Exception as e:
                 _LOGGER.error("Command error: %s", e)
@@ -768,7 +883,7 @@ class BLEManager:
             if piid == 21:
                 await self.state.update_protocol_extend(value)
                 self._sse_emit("protocol", {"switches": self.state.protocol_switches,
-                                             "protocol_extend": value})
+                                            "protocol_extend": value})
             _invalidate()
             self._publish_settings(retain=True)
             if cmd_future and not cmd_future.done():
@@ -819,6 +934,69 @@ class BLEManager:
             if cmd_future and not cmd_future.done():
                 cmd_future.set_result({"ok": False, "error": str(e)})
 
+    async def _handle_verify_port(self, cmd_data, cmd_future):
+        """Actively GET a port that has been idle too long, to detect a missed
+        unplug (push frame lost while we were busy). Updates ps from the live
+        reading so a stale V/I doesn't persist indefinitely."""
+        piid = cmd_data if isinstance(cmd_data, int) else (cmd_data[0] if isinstance(cmd_data, (list, tuple)) else None)
+        self._pending_verify.discard(piid)
+        if not piid or piid not in range(1, 5) or not self.ctrl:
+            if cmd_future and not cmd_future.done():
+                cmd_future.set_result({"ok": False, "error": "invalid piid"})
+            return
+        try:
+            result = await self.ctrl.send_miot_command(2, piid)
+            self._last_verify_time[piid] = time.time()
+            if not result:
+                # No response — connection may be stale; leave as-is.
+                _LOGGER.debug("verify_port piid=%d: no response", piid)
+                if cmd_future and not cmd_future.done():
+                    cmd_future.set_result({"ok": False, "error": "no response"})
+                return
+            raw = result.get("raw")
+            value = result.get("value")
+            # Diagnostic: log raw GET value so we can verify the byte-layout
+            # assumption below against actual device frames.
+            _LOGGER.info("verify_port piid=%d raw_value=0x%08X raw_len=%d",
+                         piid, value if isinstance(value, int) else -1,
+                         len(raw) if raw else 0)
+            # GET result value carries the port raw status bytes
+            # [status, code, current_raw, voltage_raw] in low 4 bytes.
+            if isinstance(value, int) and value >= 0:
+                raw_bytes = value.to_bytes(4, 'little')
+                cur_raw = raw_bytes[2]
+                vol_raw = raw_bytes[3]
+                voltage = vol_raw / 10.0
+                current = cur_raw / 10.0
+                old = self.state.ports.get(piid)
+                # Only correct if the live reading differs meaningfully from
+                # what we hold — prevents feedback loops on noise.
+                if old is None or (voltage, current) != (old.voltage, old.current):
+                    if voltage <= 0 and current <= 0:
+                        # Device unplugged (V=0, I=0): clear the stale port state.
+                        if piid in self._active_sessions:
+                            self._close_session(piid, time.time())
+                        port_info = dict(PORT_DEFAULT)
+                        await self.state.update_port(piid, PORT_DEFAULT)
+                        _LOGGER.info("verify_port: piid=%d unplugged (V=0,I=0), cleared stale state", piid)
+                    else:
+                        port_info = {
+                            "voltage": round(voltage, 1),
+                            "current": round(current, 1),
+                            "power": round(voltage * current, 1),
+                            "active": True,
+                            "protocol": old.protocol if old else "idle",
+                        }
+                        await self.state.update_port(piid, port_info)
+                    _invalidate()
+                    self._emit_port_state(piid, port_info)
+            if cmd_future and not cmd_future.done():
+                cmd_future.set_result({"ok": True, "value": value})
+        except Exception as e:
+            _LOGGER.warning("verify_port piid=%d error: %s", piid, e)
+            if cmd_future and not cmd_future.done():
+                cmd_future.set_result({"ok": False, "error": str(e)})
+
     async def _handle_inline_data(self, data):
         if not self.ctrl:
             return
@@ -841,11 +1019,15 @@ class BLEManager:
             _LOGGER.debug("inline_frame: decrypted=%s len=%d", pt.hex(), len(pt))
         if not pt or len(pt) < 8:
             if not pt:
-                _LOGGER.debug("inline_frame: decrypt failed")
+                # Diagnostic: log frame header + it so we can tell whether the
+                # failure is a key mismatch (device re-keyed) or frame misalignment.
+                it = raw_data[:2].hex() if raw_data and len(raw_data) >= 2 else "??"
+                kind = "single" if raw_data and len(raw_data) >= 3 and raw_data[2] == 0x02 else ("multi" if raw_data and len(raw_data) >= 3 and raw_data[2] == 0x00 else "other")
+                _LOGGER.debug("inline_frame: decrypt failed (kind=%s it=0x%s)", kind, it)
             else:
                 _LOGGER.debug("inline_frame: too short (%d < 8)", len(pt))
             self._decrypt_failures += 1
-            if self._decrypt_failures >= 10:
+            if self._decrypt_failures >= 3:
                 _LOGGER.warning("Decrypt failed %d times consecutively, session stale, triggering reconnect", self._decrypt_failures)
                 raise ConnectionError("Session stale due to consecutive decrypt failures")
             return
@@ -855,7 +1037,7 @@ class BLEManager:
 
         # 优先使用 PIID 17 的硬件协议代码 (c1_c2_protocol Spec 属性)
         # 与米家 parseC1C2ProtocolInfo 一致: byte[0]=C1, byte[2]=C2
-        hw_protocol = self.state.get_hw_protocol(piid)
+        hw_protocol = await self.state.get_hw_protocol(piid)
 
         if b4 == 0x04 and piid in PORT_NAMES:
             pdo_data = None
@@ -934,7 +1116,8 @@ class BLEManager:
                         task = loop.run_in_executor(None, self._history.start_session, piid, protocol)
                         def _on_session_start(t, p=piid):
                             if not t.exception():
-                                self._active_sessions[p] = t.result()
+                                with self._sess_lock:
+                                    self._active_sessions[p] = t.result()
                         task.add_done_callback(_on_session_start)
 
                 elif not active and es.is_charging:
@@ -997,6 +1180,10 @@ class BLEManager:
                         self.ctrl.wait_notify("cmd_recv", timeout=3.0), timeout=5.0)
                     if frame:
                         await self._try_process_inline_frame(frame)
+                except ConnectionError:
+                    # Session is stale (consecutive decrypt failures) — let it
+                    # propagate so the caller reconnects instead of swallowing it.
+                    raise
                 except (asyncio.TimeoutError, Exception) as e:
                     _LOGGER.warning("Multiframe drain stopped at frame %d/%d: %s", i+1, frame_count, e)
                     break

@@ -58,6 +58,8 @@ class CuktechBLEController:
         self.authenticated = False
         self._notify_queues = {}
         self._send_it = 0
+        self._dev_it_hi = 0      # device push counter high 16 bits (it rollover tracking)
+        self._last_dev_it_lo = 0 # last device push it low 16 bits (rollover detect)
         self.device_model: str = ""
         self.firmware_version: str = ""
         self._miot_seq = 1
@@ -163,10 +165,13 @@ class CuktechBLEController:
         _LOGGER.info("Connecting to %s...", self.mac)
         self.client = BleakClient(self.mac)
         await self.client.connect()
-        try:
-            await self.client._acquire_mtu()
-        except (AttributeError, Exception):
-            _LOGGER.warning("MTU negotiation failed, using default MTU=%d", self.client.mtu_size)
+        # Bleak (>=0.20, here 3.0.x) auto-negotiates MTU during connect; there is
+        # no manual _acquire_mtu() anymore. Read the negotiated value for
+        # diagnostics. A small MTU (23) fragments port push frames — log it so
+        # we can monitor, but accept whatever the device/backend negotiated.
+        self._mtu = getattr(self.client, 'mtu_size', 23)
+
+        _LOGGER.info("Negotiated MTU=%d", self._mtu)
 
         # 清理可能残留的通知队列
         for q in self._notify_queues.values():
@@ -492,16 +497,13 @@ class CuktechBLEController:
         # R: response  (0x0c, 32B)  → W: keepalive → W: ACK → R: RCV_RDY
         # W: second auth response (0x0c, 32B) → R: RCV_OK
         try:
-            deadline = asyncio.get_event_loop().time() + 8.0
+            deadline = asyncio.get_running_loop().time() + 8.0
             challenge_data = None
             response_data = None
 
-            while asyncio.get_event_loop().time() - deadline < 0:
-                break
-
             # 读取 challenge + response + RCV_RDY
-            while asyncio.get_event_loop().time() - deadline < 0:
-                remaining = deadline - asyncio.get_event_loop().time()
+            while asyncio.get_running_loop().time() - deadline < 0:
+                remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     break
                 data = await self.wait_notify("auth_data", timeout=min(remaining, 3.0))
@@ -657,9 +659,19 @@ class CuktechBLEController:
             _LOGGER.warning("Decrypt data too short: %d bytes", len(data))
             return None
 
-        it = data[:2]
+        # Device sends only the low 16 bits of its incrementing counter in the
+        # frame (it_lo + it_hi). Once the device's counter exceeds 65535, its
+        # nonce uses high 16 bits != 0 — the old code assumed those were always
+        # 0 and decrypt failed. Track the high 16 bits ourselves by detecting
+        # low-16-bit wraparound (counter incremented past 0xFFFF).
+        it_lo = struct.unpack('<H', data[:2])[0]
+        if (it_lo < self._last_dev_it_lo
+                and (self._last_dev_it_lo - it_lo) > 32768):
+            self._dev_it_hi += 1  # low 16 bits wrapped → high 16 bits carried
+        self._last_dev_it_lo = it_lo
+        it_bytes = struct.pack('<I', (self._dev_it_hi << 16) | it_lo)
         ct = data[2:]
-        nonce = self._session_keys['dev_iv'] + b'\x00' * 4 + it + b'\x00' * 2
+        nonce = self._session_keys['dev_iv'] + b'\x00' * 4 + it_bytes
 
         try:
             aes_ccm = AESCCM(self._session_keys['dev_key'], tag_length=4)
@@ -683,6 +695,8 @@ class CuktechBLEController:
     async def _setup_cmd_channel(self):
         """认证成功后，初始化命令通道 (已在 connect 中预订阅)。"""
         self._send_it = 0
+        self._dev_it_hi = 0      # reset device it rollover tracking (device it restarts at 0)
+        self._last_dev_it_lo = 0
         self._miot_seq = 1  # MiOT 命令序列号 (从1开始)
         await asyncio.sleep(0.5)
         await self._drain_pending_pushes()
@@ -879,6 +893,17 @@ class CuktechBLEController:
                         val = pt[11]
                 return {'piid': piid, 'value': val, 'raw': pt}
 
+            # Don't swallow live port pushes received while awaiting SET ACK/
+            # Result — replay them so the main loop processes them normally.
+            if (b4 == 0x02 and pt_siid == 2 and 1 <= pt_piid <= 4):
+                q = self._notify_queues.get("cmd_recv")
+                if q and data and len(data) >= 3 and data[2] == 0x02:
+                    try:
+                        q.put_nowait(data)
+                        continue
+                    except asyncio.QueueFull:
+                        pass
+
         if got_ack:
             _LOGGER.debug("SET acknowledged (ACK only)")
             return {'piid': piid, 'value': None, 'raw': None}
@@ -912,6 +937,20 @@ class CuktechBLEController:
                     else:
                         result_value = pt[13] if len(pt) > 13 else None
                 return {'piid': piid, 'value': result_value, 'raw': pt}
+
+            # Not our GET response. If it's a live port push (b4==0x02, siid==2,
+            # piid 1..4), don't swallow it — put the raw frame back so the main
+            # loop processes it as normal port data. ACK was already sent in
+            # _try_decode_inline, so the device won't re-push.
+            if (b4 == 0x02 and pt_siid == 2 and 1 <= pt_piid <= 4):
+                q = self._notify_queues.get("cmd_recv")
+                if q and data and len(data) >= 3 and data[2] == 0x02:
+                    try:
+                        q.put_nowait(data)
+                        continue
+                    except asyncio.QueueFull:
+                        pass
+                # fall through: drop if replay fails (rare)
 
         _LOGGER.debug("GET no response")
         return None

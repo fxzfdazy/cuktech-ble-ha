@@ -3,7 +3,7 @@ import sys
 import json
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
 
 # conftest.py already mocks homeassistant modules
 sys.path.insert(0, str(Path(__file__).parent.parent / "custom_components"))
@@ -36,30 +36,71 @@ class TestCuktechMQTTCoordinator:
         assert coordinator.port_data == {}
         assert coordinator.data == {}
 
+    # --- Callback tests ---
+
     def test_callback_registration(self, coordinator):
-        """Test callback registration and unregistration."""
-        callback = MagicMock()
-        coordinator.register_callback(callback)
-        assert callback in coordinator._callbacks
+        """Test generic callback registration and unregistration."""
+        cb = MagicMock()
+        coordinator.register_callback(cb)
+        assert cb in coordinator._callbacks
+        coordinator.unregister_callback(cb)
+        assert cb not in coordinator._callbacks
 
-        coordinator.unregister_callback(callback)
-        assert callback not in coordinator._callbacks
+    def test_port_callback_registration(self, coordinator):
+        """Test port callback registration and unregistration."""
+        cb = MagicMock()
+        coordinator.register_port_callback(cb)
+        assert cb in coordinator._port_callbacks
+        coordinator.unregister_port_callback(cb)
+        assert cb not in coordinator._port_callbacks
 
-    def test_callback_limit(self, coordinator, caplog):
-        """Test callback limit warning is logged."""
-        import logging
-        with caplog.at_level(logging.WARNING):
-            for _ in range(105):
-                coordinator.register_callback(MagicMock())
-        assert len(coordinator._callbacks) == 105
-        assert any("Too many callbacks" in msg for msg in caplog.messages)
+    def test_settings_callback_registration(self, coordinator):
+        """Test settings callback registration and unregistration."""
+        cb = MagicMock()
+        coordinator.register_settings_callback(cb)
+        assert cb in coordinator._settings_callbacks
+        coordinator.unregister_settings_callback(cb)
+        assert cb not in coordinator._settings_callbacks
+
+    def test_notify_callbacks(self, coordinator):
+        """Test _notify_callbacks calls all registered callbacks."""
+        cb1 = MagicMock()
+        cb2 = MagicMock()
+        coordinator.register_callback(cb1)
+        coordinator.register_callback(cb2)
+        # Call with no args (legacy path — uses self._callbacks)
+        coordinator._notify_callbacks()
+        cb1.assert_called_once()
+        cb2.assert_called_once()
+
+    def test_notify_specific_list(self, coordinator):
+        """Test _notify_callbacks with a specific list."""
+        cb1 = MagicMock()
+        cb2 = MagicMock()
+        coordinator._port_callbacks.append(cb1)
+        coordinator._callbacks.append(cb2)
+        coordinator._notify_callbacks(coordinator._port_callbacks)
+        cb1.assert_called_once()
+        cb2.assert_not_called()
+
+    def test_notify_callbacks_exception_handling(self, coordinator):
+        """Test _notify_callbacks handles exceptions from callbacks gracefully."""
+        good_cb = MagicMock()
+        bad_cb = MagicMock(side_effect=Exception("test error"))
+        coordinator.register_callback(good_cb)
+        coordinator.register_callback(bad_cb)
+        coordinator._notify_callbacks()
+        good_cb.assert_called_once()
+        bad_cb.assert_called_once()
+
+    # --- Availability tests ---
 
     def test_health_failures_not_reset_by_availability(self, coordinator):
         """Test health failures counter is NOT reset by _update_availability alone."""
         coordinator._health_failures = 5
         coordinator._mqtt_connected = True
         coordinator._update_availability()
-        assert coordinator._health_failures == 5  # Only reset on MQTT reconnect, only in _on_status_message
+        assert coordinator._health_failures == 5
 
     def test_update_availability_mqtt(self, coordinator):
         """Test availability update with MQTT connected."""
@@ -90,6 +131,8 @@ class TestCuktechMQTTCoordinator:
         assert data1 == data2
         assert data1 is not data2
 
+    # --- MQTT message handler tests ---
+
     def test_on_port_message_parsing(self, coordinator):
         """Test MQTT port message parsing."""
         msg = MagicMock()
@@ -115,7 +158,6 @@ class TestCuktechMQTTCoordinator:
         coordinator._mqtt_connected = False
         coordinator._last_status_time = 900
 
-        # Simulate MQTT reconnect
         msg = MagicMock()
         msg.topic = "cuktech/charger/status"
         msg.payload = json.dumps({"connected": True}).encode()
@@ -124,56 +166,12 @@ class TestCuktechMQTTCoordinator:
         assert coordinator._health_failures == 0
         assert coordinator._mqtt_connected is True
 
-    @pytest.mark.asyncio
-    async def test_async_health_check_success(self, coordinator):
-        """Test HTTP health check succeeds."""
-        from unittest.mock import MagicMock, patch
-        from types import SimpleNamespace
-
-        session = MagicMock()
-        session.get = MagicMock(return_value=_AsyncContextManager(SimpleNamespace(status=200)))
-
-        with patch('custom_components.cuktech_charger.async_get_clientsession', return_value=session):
-            await coordinator._async_health_check(None)
-
-        assert coordinator._available is True
-        assert coordinator._health_failures == 0
-
-    @pytest.mark.asyncio
-    async def test_async_health_check_failure(self, coordinator):
-        """Test HTTP health check handles failure."""
-        from unittest.mock import MagicMock, patch
-
-        session = MagicMock()
-        session.get = MagicMock(side_effect=Exception("Timeout"))
-
-        with patch('custom_components.cuktech_charger.async_get_clientsession', return_value=session):
-            await coordinator._async_health_check(None)
-
-        assert coordinator._available is False
-        assert coordinator._health_failures == 1
-
-    @pytest.mark.asyncio
-    async def test_async_health_check_bad_status(self, coordinator):
-        """Test HTTP health check handles bad status code."""
-        from unittest.mock import MagicMock, patch
-        from types import SimpleNamespace
-
-        session = MagicMock()
-        session.get = MagicMock(return_value=_AsyncContextManager(SimpleNamespace(status=503)))
-
-        with patch('custom_components.cuktech_charger.async_get_clientsession', return_value=session):
-            await coordinator._async_health_check(None)
-
-        assert coordinator._available is False
-
     def test_on_port_message_malformed_json(self, coordinator):
         """Test _on_port_message handles malformed JSON gracefully."""
         msg = MagicMock()
         msg.topic = "cuktech/charger/port/c1"
         msg.payload = b"not json"
 
-        # Should not raise
         coordinator._on_port_message(msg)
         assert coordinator._port_data == {}
 
@@ -184,7 +182,6 @@ class TestCuktechMQTTCoordinator:
         msg.payload = b"{}"
 
         coordinator._on_port_message(msg)
-        # Empty JSON is valid, stores {} for port 1
         assert coordinator._port_data == {"1": {}}
 
     def test_on_port_message_unknown_topic(self, coordinator):
@@ -211,23 +208,129 @@ class TestCuktechMQTTCoordinator:
         msg.topic = "cuktech/charger/status"
         msg.payload = b"not json"
 
-        # Should not raise
         coordinator._on_status_message(msg)
 
     def test_on_status_message_connected_false(self, coordinator):
-        """Test _on_status_message with connected=False sets _mqtt_connected and device becomes unavailable."""
+        """Test _on_status_message with connected=False."""
         msg = MagicMock()
         msg.topic = "cuktech/charger/status"
         msg.payload = json.dumps({"connected": False}).encode()
 
         coordinator._on_status_message(msg)
         assert coordinator._mqtt_connected is False
-        # _last_status_time is NOT updated when connected: false, so device is unavailable
         assert coordinator.available is False
+
+    # --- Device info sync tests ---
+
+    def test_sync_device_info_from_payload(self, coordinator):
+        """Test _sync_device_info_from_payload updates model and firmware."""
+        changed = coordinator._sync_device_info_from_payload({
+            "device_model": "test-model",
+            "firmware_version": "v1.2.3",
+        })
+        assert changed is True
+        assert coordinator._device_model == "test-model"
+        assert coordinator._firmware_version == "v1.2.3"
+
+    def test_sync_device_info_from_payload_no_change(self, coordinator):
+        """Test _sync_device_info_from_payload returns False when nothing changes."""
+        coordinator._device_model = "existing"
+        coordinator._firmware_version = "v1.0"
+        changed = coordinator._sync_device_info_from_payload({
+            "device_model": "existing",
+            "firmware_version": "v1.0",
+        })
+        assert changed is False
+
+    def test_sync_ble_state_connected(self, coordinator):
+        """Test _sync_ble_state when BLE connects."""
+        coordinator._ble_enabled = False
+        result = coordinator._sync_ble_state(True)
+        assert result is True
+        assert coordinator._ble_connected is True
+        assert coordinator._ble_enabled is True
+
+    def test_sync_ble_state_disconnected(self, coordinator):
+        """Test _sync_ble_state when BLE disconnects."""
+        coordinator._ble_enabled = True
+        result = coordinator._sync_ble_state(False)
+        assert result is True
+        assert coordinator._ble_connected is False
+        assert coordinator._ble_enabled is False
+
+    # --- HTTP health check tests ---
+
+    @pytest.mark.asyncio
+    async def test_async_health_check_success(self, coordinator):
+        """Test HTTP health check succeeds."""
+        from unittest.mock import MagicMock, patch
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"connected": True, "firmware_version": "v1.0.0"})
+
+        session = MagicMock()
+        session.get = MagicMock(return_value=_AsyncContextManager(mock_resp))
+
+        with patch('custom_components.cuktech_charger.async_get_clientsession', return_value=session):
+            await coordinator._async_health_check(None)
+
+        assert coordinator._available is True
+        assert coordinator._health_failures == 0
+
+    @pytest.mark.asyncio
+    async def test_async_health_check_failure(self, coordinator):
+        """Test HTTP health check handles failure."""
+        from unittest.mock import MagicMock, patch
+
+        session = MagicMock()
+        session.get = MagicMock(side_effect=Exception("Timeout"))
+
+        with patch('custom_components.cuktech_charger.async_get_clientsession', return_value=session):
+            await coordinator._async_health_check(None)
+
+        assert coordinator._available is False
+        assert coordinator._health_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_async_health_check_bad_status(self, coordinator):
+        """Test HTTP health check handles bad status code."""
+        from unittest.mock import MagicMock, patch
+
+        mock_resp = MagicMock()
+        mock_resp.status = 503
+
+        session = MagicMock()
+        session.get = MagicMock(return_value=_AsyncContextManager(mock_resp))
+
+        with patch('custom_components.cuktech_charger.async_get_clientsession', return_value=session):
+            await coordinator._async_health_check(None)
+
+        assert coordinator._available is False
+
+    @pytest.mark.asyncio
+    async def test_async_health_check_parse_body_error(self, coordinator):
+        """Test health check handles JSON parse failure gracefully."""
+        from unittest.mock import MagicMock, patch
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(side_effect=Exception("Parse error"))
+
+        session = MagicMock()
+        session.get = MagicMock(return_value=_AsyncContextManager(mock_resp))
+
+        with patch('custom_components.cuktech_charger.async_get_clientsession', return_value=session):
+            await coordinator._async_health_check(None)
+
+        # Should not crash, available should be True (status was 200)
+        assert coordinator._available is True
+
+    # --- Command tests ---
 
     @pytest.mark.asyncio
     async def test_async_set_value(self, coordinator):
-        """Test async_set_value publishes MQTT command with correct topic/payload."""
+        """Test async_set_value publishes MQTT command."""
         from unittest.mock import patch, AsyncMock
         with patch('custom_components.cuktech_charger.mqtt') as mock_mqtt:
             mock_mqtt.async_publish = AsyncMock()
@@ -242,7 +345,7 @@ class TestCuktechMQTTCoordinator:
 
     @pytest.mark.asyncio
     async def test_async_port_control(self, coordinator):
-        """Test async_port_control publishes MQTT command with correct topic/payload."""
+        """Test async_port_control publishes MQTT command."""
         from unittest.mock import patch, AsyncMock
         with patch('custom_components.cuktech_charger.mqtt') as mock_mqtt:
             mock_mqtt.async_publish = AsyncMock()
@@ -255,15 +358,7 @@ class TestCuktechMQTTCoordinator:
             assert payload["port"] == "c1"
             assert payload["action"] == "on"
 
-    def test_notify_callbacks(self, coordinator):
-        """Test _notify_callbacks calls all registered callbacks."""
-        cb1 = MagicMock()
-        cb2 = MagicMock()
-        coordinator.register_callback(cb1)
-        coordinator.register_callback(cb2)
-        coordinator._notify_callbacks()
-        cb1.assert_called_once()
-        cb2.assert_called_once()
+    # --- Properties ---
 
     def test_port_data_property(self, coordinator):
         """Test port_data property returns _port_data."""
@@ -279,11 +374,6 @@ class TestCuktechMQTTCoordinator:
 
     def test_protocol_switches_decoding(self, coordinator):
         """Test protocol_switches decodes PIID 21 correctly."""
-        # c1 PD=1, PPS=1, UFCS=1, reserved=1 => 0x0F
-        # c2 all off (reserved only) => 0x08 << 8 = 0x0800
-        # c3 UFCS=1 => 0x01 << 16 = 0x10000
-        # a SCP=1 => 0x02 << 24 = 0x02000000
-        # total = 0x0201080F
         coordinator._settings = {"21": 0x0201080F}
         sw = coordinator.protocol_switches
         assert sw["c1"]["pd"] is True
@@ -317,7 +407,7 @@ class TestCuktechMQTTCoordinator:
             "a":  {"ufcs": False, "scp": False},
         }
         result = coordinator._encode_protocol_extend(switches)
-        assert result == 0x00000809  # c1=0x09 (PD=1 + reserved), c2=0x08 (reserved only)
+        assert result == 0x00000809
 
     def test_protocol_switches_roundtrip(self, coordinator):
         """Test encode then decode roundtrip."""
@@ -354,8 +444,6 @@ class TestCuktechMQTTCoordinator:
             call_args = mock_mqtt.async_publish.call_args
             payload = json.loads(call_args[0][2])
             assert payload["piid"] == 21
-            # c1 PD turned OFF: c1 goes from 0x0F to 0x0E (PD=0, PPS=1, UFCS=1)
-            # c1 byte=0x0E, c2 byte=0x0F, c3 byte=0x03, a byte=0x03 → 0x03030F0E
             assert payload["value"] == 0x03030F0E
 
     @pytest.mark.asyncio

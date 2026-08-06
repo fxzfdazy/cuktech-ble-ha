@@ -237,45 +237,45 @@ class TestChargerState:
 class TestHwProtocol:
     """Test hardware protocol code extraction from PIID 17/18."""
 
-    def test_hw_protocol_initial(self):
+    async def test_hw_protocol_initial(self):
         """Initial hw_protocol should be None for all ports."""
         state = ChargerState()
         for piid in (1, 2, 3, 4):
-            assert state.get_hw_protocol(piid) is None
+            assert await state.get_hw_protocol(piid) is None
 
-    def test_set_hw_protocol_c1c2(self):
+    async def test_set_hw_protocol_c1c2(self):
         """PIID 17 sets C1/C2 protocol codes."""
         state = ChargerState()
-        state.set_hw_protocol_codes(9, 7)
-        assert state.get_hw_protocol(1) == 9   # C1 = PPS
-        assert state.get_hw_protocol(2) == 7   # C2 = PD
-        assert state.get_hw_protocol(3) is None  # C3 untouched
-        assert state.get_hw_protocol(4) is None  # A untouched
+        await state.set_hw_protocol_codes(9, 7)
+        assert await state.get_hw_protocol(1) == 9   # C1 = PPS
+        assert await state.get_hw_protocol(2) == 7   # C2 = PD
+        assert await state.get_hw_protocol(3) is None  # C3 untouched
+        assert await state.get_hw_protocol(4) is None  # A untouched
 
-    def test_set_hw_protocol_c3a(self):
+    async def test_set_hw_protocol_c3a(self):
         """PIID 18 sets C3/A protocol codes."""
         state = ChargerState()
-        state.set_hw_protocol_codes_c3a(7, 0)
-        assert state.get_hw_protocol(3) == 7   # C3 = PD
-        assert state.get_hw_protocol(4) is None  # A = 0 → None
-        assert state.get_hw_protocol(1) is None  # C1 untouched
+        await state.set_hw_protocol_codes_c3a(7, 0)
+        assert await state.get_hw_protocol(3) == 7   # C3 = PD
+        assert await state.get_hw_protocol(4) is None  # A = 0 → None
+        assert await state.get_hw_protocol(1) is None  # C1 untouched
 
-    def test_zero_protection_c1c2(self):
+    async def test_zero_protection_c1c2(self):
         """PIID 17 zero values should not overwrite existing protocol codes."""
         state = ChargerState()
-        state.set_hw_protocol_codes(9, 7)  # set C1=PPS, C2=PD
-        state.set_hw_protocol_codes(0, 7)  # C1=0 should be ignored
-        assert state.get_hw_protocol(1) == 9  # C1 preserved
-        assert state.get_hw_protocol(2) == 7  # C2 updated
+        await state.set_hw_protocol_codes(9, 7)  # set C1=PPS, C2=PD
+        await state.set_hw_protocol_codes(0, 7)  # C1=0 should be ignored
+        assert await state.get_hw_protocol(1) == 9  # C1 preserved
+        assert await state.get_hw_protocol(2) == 7  # C2 updated
 
-    def test_zero_protection_c3a(self):
+    async def test_zero_protection_c3a(self):
         """PIID 18 zero values should not overwrite."""
         state = ChargerState()
-        state.set_hw_protocol_codes_c3a(7, 0)
-        assert state.get_hw_protocol(3) == 7
-        state.set_hw_protocol_codes_c3a(0, 3)
-        assert state.get_hw_protocol(3) == 7  # preserved
-        assert state.get_hw_protocol(4) == 3  # updated
+        await state.set_hw_protocol_codes_c3a(7, 0)
+        assert await state.get_hw_protocol(3) == 7
+        await state.set_hw_protocol_codes_c3a(0, 3)
+        assert await state.get_hw_protocol(3) == 7  # preserved
+        assert await state.get_hw_protocol(4) == 3  # updated
 
     def test_piid17_byte_extraction(self):
         """Verify PIID 17 value parsing: byte[0]=C1, byte[2]=C2."""

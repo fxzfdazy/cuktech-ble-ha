@@ -155,6 +155,13 @@
             4: { voltage: [], current: [], power: [], protocol: [] }
         };
 
+        // ── Real-time modal chart ──
+        const REAL_TIME_WINDOW_MS = 10 * 60 * 1000;  // 保留最近10分钟
+        let realTimeBuf = { 1: [], 2: [], 3: [], 4: [] };
+        let modalRealTimePort = null;
+        let modalRealTimeDebounce = null;
+        let modalRealTimeTimer = null;  // 数据稳定时的后台刷新定时器
+
         function setTimeRange(minutes) {
             setCurrentHours(minutes / 60);
             localStorage.setItem('cuktech-chart-hours', minutes);
@@ -248,6 +255,82 @@
             powerChart.update('none');
         }
 
+        // ── Real-time modal chart ──
+        function toggleModalRealTime() {
+            const btn = document.getElementById('modalRealTimeBtn');
+            if (modalRealTimePort !== null) {
+                modalRealTimePort = null;
+                btn.classList.remove('active');
+                btn.textContent = '⚡ 实时';
+                if (modalRealTimeDebounce) { clearTimeout(modalRealTimeDebounce); modalRealTimeDebounce = null; }
+                if (modalRealTimeTimer) { clearInterval(modalRealTimeTimer); modalRealTimeTimer = null; }
+                if (currentModalPort) updateModalChart();
+            } else {
+                modalRealTimePort = currentModalPort;
+                btn.classList.add('active');
+                btn.textContent = '⏹ 实时';
+                // 后台 2 秒刷新：数据到达时会通过 500ms 去抖更快更新，无数据时图表保持最新
+                if (modalRealTimeTimer) clearInterval(modalRealTimeTimer);
+                modalRealTimeTimer = setInterval(_updateRealTimeModalChart, 2000);
+                _updateRealTimeModalChart();
+            }
+        }
+
+        function _buildRealTimeLabels(buf, offset, count) {
+            return buf.slice(offset, offset + count).map(e => {
+                const d = new Date(e.ts);
+                return String(d.getHours()).padStart(2,'0') + ':' +
+                       String(d.getMinutes()).padStart(2,'0') + ':' +
+                       String(d.getSeconds()).padStart(2,'0');
+            });
+        }
+
+        function _accumulateRealTimeData(portId, data) {
+            const ts = Date.now();
+            const buf = realTimeBuf[portId];
+            buf.push({ ts, voltage: data.voltage, current: data.current, power: data.power, protocol: data.protocol });
+            const cutoff = ts - REAL_TIME_WINDOW_MS;
+            while (buf.length > 0 && buf[0].ts < cutoff) buf.shift();
+            // 弹窗实时模式下，对应当前端口的数据到达时去抖更新图表
+            if (modalRealTimePort !== null && portId === modalRealTimePort) {
+                if (modalRealTimeDebounce) clearTimeout(modalRealTimeDebounce);
+                modalRealTimeDebounce = setTimeout(() => {
+                    modalRealTimeDebounce = null;
+                    _updateRealTimeModalChart();
+                }, 500);
+            }
+        }
+
+        function _updateRealTimeModalChart() {
+            if (!currentModalPort || !modalChart || modalRealTimePort === null) return;
+            const buf = realTimeBuf[currentModalPort];
+            if (!buf || buf.length < 1) return;
+            // ── 更新弹窗顶部的瞬时值 ──
+            const rt = latestPorts[currentModalPort];
+            if (rt) {
+                document.getElementById('modalVoltage').textContent = rt.voltage.toFixed(1);
+                document.getElementById('modalCurrent').textContent = rt.current.toFixed(2);
+                document.getElementById('modalPower').textContent = rt.power.toFixed(1);
+                const protocolEl = document.getElementById('modalProtocol');
+                if (protocolEl) {
+                    protocolEl.textContent = rt.protocol || 'idle';
+                    protocolEl.style.color = (rt.protocol && rt.protocol !== 'idle') ? 'var(--accent)' : 'var(--text-dim)';
+                }
+            }
+            // ── 更新图表曲线 ──
+            const MAX_VISIBLE = 120;
+            const showBuf = buf.slice(-MAX_VISIBLE);
+            const padding = MAX_VISIBLE - showBuf.length;
+            const padLabels = new Array(padding).fill('--:--:--');
+            const padZeros = new Array(padding).fill(0);
+            const realLabels = _buildRealTimeLabels(showBuf, 0, showBuf.length);
+            modalChart.data.labels = [...padLabels, ...realLabels];
+            modalChart.data.datasets[0].data = [...padZeros, ...showBuf.map(e => e.voltage)];
+            modalChart.data.datasets[1].data = [...padZeros, ...showBuf.map(e => e.current)];
+            modalChart.data.datasets[2].data = [...padZeros, ...showBuf.map(e => e.power)];
+            modalChart.update('none');
+        }
+
         function initModalChart() {
             if (modalChart) modalChart.destroy();
             const colors = getChartColors();
@@ -328,10 +411,22 @@
             finally { btn.disabled = false; }
         }
 
-        function closeModal() { document.getElementById('portModal').classList.remove('show'); currentModalPort = null; }
+        function closeModal() {
+            document.getElementById('portModal').classList.remove('show');
+            currentModalPort = null;
+            // 关闭弹窗时自动退出实时曲线模式
+            if (modalRealTimePort !== null) {
+                const btn = document.getElementById('modalRealTimeBtn');
+                if (btn) { btn.classList.remove('active'); btn.textContent = '⚡ 实时'; }
+                modalRealTimePort = null;
+                if (modalRealTimeDebounce) { clearTimeout(modalRealTimeDebounce); modalRealTimeDebounce = null; }
+                if (modalRealTimeTimer) { clearInterval(modalRealTimeTimer); modalRealTimeTimer = null; }
+            }
+        }
 
         function updateModalChart() {
             if (!currentModalPort || !modalChart) return;
+            if (modalRealTimePort !== null) { _updateRealTimeModalChart(); return; }
             const h = portHistory[currentModalPort];
             modalChart.data.labels = [...powerChart.data.labels.slice(-h.voltage.length)];
             modalChart.data.datasets[0].data = [...h.voltage];
@@ -677,6 +772,17 @@
                 fetchChartData();
                 initSSE();
                 fetchBemfaStatus();
+                // 安全兜底：每 30s 轮询 /api/status 校正因 SSE 队列丢事件导致的连接状态偏差
+                setInterval(async () => {
+                    try {
+                        const res = await fetch(`${API_BASE}/api/status`);
+                        const data = await res.json();
+                        const realConn = data.connected && data.authenticated;
+                        if (realConn !== bleConnected) {
+                            updateUI(data);
+                        }
+                    } catch (e) {}
+                }, 30000);
             } catch (e) {
                 console.error('Init error:', e);
                 // Fallback to polling if SSE fails
@@ -710,6 +816,7 @@
                             updateUI(msg);
                             break;
                         case 'port_update':
+                            _accumulateRealTimeData(msg.port_id, msg.data);
                             updatePortDOM(msg.port_id, msg.data);
                             updateDeviceContainer(latestPorts);
                             break;

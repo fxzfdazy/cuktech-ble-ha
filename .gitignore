@@ -59,6 +59,7 @@ docs/plugin_analysis
 docs/apk
 docs/smali_out2
 docs/smali_out3
+docs/loadtest
 docs/tmp
 docs/tools
 docs/bug.md

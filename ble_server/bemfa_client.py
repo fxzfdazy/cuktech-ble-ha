@@ -117,7 +117,7 @@ class BemfaClient:
         await self._register_topics()
 
         # Connect MQTT (in thread pool since paho is synchronous)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._connect_mqtt)
 
         # Start ping/pong keepalive (aligned with HA integration)
@@ -139,7 +139,7 @@ class BemfaClient:
         self._ping_receive_task = None
 
         if self._client:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._disconnect_mqtt)
             self._client = None
 
@@ -235,7 +235,20 @@ class BemfaClient:
                     _LOGGER.debug("Bemfa ignoring echo: %s=%s", topic, data)
                     return
 
-                on = data.strip().lower() == "on"
+                # ── Echo avoidance: if received state matches cached state, skip ──
+                cached = self._state_cache.get(topic)
+                incoming = data.strip().lower()
+                if cached == incoming:
+                    _LOGGER.debug("Bemfa skipping echo (state unchanged): %s=%s", entity_id, data)
+                    return
+
+                # ── Command debounce: skip duplicate cmd within 1s ──
+                last = getattr(self, '_last_cmd_time', {}).get(entity_id)
+                if last and now - last < 1.0:
+                    _LOGGER.debug("Bemfa debounce: %s=%s (%.1fs since last)", entity_id, data, now - last)
+                    return
+
+                on = incoming == "on"
                 _LOGGER.info("Bemfa recv: %s=%s", entity_id, data)
 
                 # Execute command
@@ -248,6 +261,9 @@ class BemfaClient:
                     if ok:
                         with self._lock:
                             self._state_cache[topic] = MSG_ON if on else MSG_OFF
+                        if not hasattr(self, '_last_cmd_time'):
+                            self._last_cmd_time = {}
+                        self._last_cmd_time[entity_id] = now
                 except Exception as e:
                     _LOGGER.error("Bemfa command error: %s=%s: %s", entity_id, data, e)
                 break
@@ -335,7 +351,7 @@ class BemfaClient:
         self._ping_publish_task = None
         self._ping_receive_task = None
         # Disconnect MQTT
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         if self._client:
             await loop.run_in_executor(None, self._disconnect_mqtt)
         # Reconnect MQTT

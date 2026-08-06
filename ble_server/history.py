@@ -25,6 +25,7 @@ class PortHistory:
         self._conn: Optional[sqlite3.Connection] = None
         self._db_lock = threading.Lock()  # 保护所有读写操作
         self._last_cleanup = 0
+        self._last_wal_checkpoint = 0
 
     def connect(self):
         """Open database connection and create tables."""
@@ -34,15 +35,25 @@ class PortHistory:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA wal_autocheckpoint=1000")  # checkpoint every 1000 pages
         self._create_tables()
         self._cleanup_old_data()
         _LOGGER.info("History database connected: %s", self.db_path)
 
     def close(self):
-        """Close database connection."""
+        """Close database connection with checkpoint and graceful shutdown."""
         if self._conn:
-            self._conn.close()
+            try:
+                # Try to checkpoint WAL before closing
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            try:
+                self._conn.close()
+            except Exception:
+                pass
             self._conn = None
+            _LOGGER.info("History database closed")
 
     def _create_tables(self):
         """Create database tables and run migrations."""
@@ -98,6 +109,13 @@ class PortHistory:
             self._conn.execute("ALTER TABLE charge_points ADD COLUMN protocol TEXT DEFAULT ''")
             self._conn.commit()
 
+    def _checkpoint_wal(self):
+        """Run WAL checkpoint if enough pages have accumulated."""
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
+
     def _cleanup_old_data(self):
         """Remove data older than retention period."""
         cutoff = time.time() - (self.retention_days * 86400)
@@ -134,6 +152,10 @@ class PortHistory:
                 if now - self._last_cleanup > 3600:
                     self._cleanup_old_data()
                     self._last_cleanup = now
+                # Periodic WAL checkpoint every 5 minutes
+                if now - self._last_wal_checkpoint > 300:
+                    self._checkpoint_wal()
+                    self._last_wal_checkpoint = now
             except Exception as e:
                 _LOGGER.error("Failed to record port data: %s", e)
 

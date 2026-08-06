@@ -181,30 +181,33 @@ class ChargerState:
             self.pdo_caps = pdo_caps
             self._invalidate_cache()
 
-    def set_hw_protocol_codes(self, c1: int, c2: int):
+    async def set_hw_protocol_codes(self, c1: int, c2: int):
         """设置 PIID 17 解析出的硬件协议代码。零值不覆盖已有值。"""
-        if c1 > 0:
-            self._hw_protocol_c1 = c1
-        if c2 > 0:
-            self._hw_protocol_c2 = c2
+        async with self._lock:
+            if c1 > 0:
+                self._hw_protocol_c1 = c1
+            if c2 > 0:
+                self._hw_protocol_c2 = c2
 
-    def set_hw_protocol_codes_c3a(self, c3: int, a: int):
+    async def set_hw_protocol_codes_c3a(self, c3: int, a: int):
         """设置 PIID 18 解析出的硬件协议代码。零值不覆盖已有值。"""
-        if c3 > 0:
-            self._hw_protocol_c3 = c3
-        if a > 0:
-            self._hw_protocol_a = a
+        async with self._lock:
+            if c3 > 0:
+                self._hw_protocol_c3 = c3
+            if a > 0:
+                self._hw_protocol_a = a
 
-    def get_hw_protocol(self, piid: int) -> Optional[int]:
+    async def get_hw_protocol(self, piid: int) -> Optional[int]:
         """获取硬件协议代码 (来自 PIID 17/18)"""
-        _map = {
-            1: self._hw_protocol_c1,
-            2: self._hw_protocol_c2,
-            3: self._hw_protocol_c3,
-            4: self._hw_protocol_a,
-        }
-        val = _map.get(piid, 0)
-        return val or None
+        async with self._lock:
+            _map = {
+                1: self._hw_protocol_c1,
+                2: self._hw_protocol_c2,
+                3: self._hw_protocol_c3,
+                4: self._hw_protocol_a,
+            }
+            val = _map.get(piid, 0)
+            return val or None
 
     async def update_protocol_extend(self, value: int):
         """Update PIID 21 protocol extend value."""

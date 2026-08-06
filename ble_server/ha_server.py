@@ -12,8 +12,9 @@ import hashlib
 import json
 import logging
 import os
-import signal
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from aiohttp import web
 
@@ -39,38 +40,73 @@ _LOGGER = logging.getLogger("cuktech_server")
 _sse_log = logging.getLogger("cuktech_sse")
 
 
+# ── Request size limit (prevent DoS via large payloads) ──
+MAX_REQUEST_BODY_SIZE = 1024 * 1024  # 1 MB
+
+
 class SSEEmitter:
     """SSE event broadcaster — push events to all connected browser clients."""
 
-    MAX_QUEUE_SIZE = 64
+    MAX_QUEUE_SIZE = 128
 
     def __init__(self):
         self._clients: set[asyncio.Queue] = set()
+        self._pending_status: dict[int, str] = {}  # id(queue) -> latest status payload
+        self._lock = threading.Lock()
 
     def add_client(self, queue: asyncio.Queue):
-        self._clients.add(queue)
+        with self._lock:
+            self._clients.add(queue)
         _sse_log.info("SSE client connected (total: %d)", len(self._clients))
 
     def remove_client(self, queue: asyncio.Queue):
-        self._clients.discard(queue)
+        with self._lock:
+            self._clients.discard(queue)
+            self._pending_status.pop(id(queue), None)
         _sse_log.info("SSE client disconnected (total: %d)", len(self._clients))
 
-    def emit(self, event_type: str, data: dict):
-        """Broadcast event to all connected clients. Non-blocking, drops oldest on full queue."""
-        payload = json.dumps({"type": event_type, **data}, ensure_ascii=False)
-        for q in list(self._clients):
+    def _put_or_drop(self, q: asyncio.Queue, payload: str):
+        """Put payload in queue; drop oldest if full."""
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            _sse_log.warning("SSE queue full, dropping oldest event (qsize=%s)", q.qsize())
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
             try:
                 q.put_nowait(payload)
             except asyncio.QueueFull:
-                # Drop oldest event to make room for the new one
-                try:
-                    q.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                try:
-                    q.put_nowait(payload)
-                except asyncio.QueueFull:
-                    pass
+                pass
+
+    def emit(self, event_type: str, data: dict):
+        """Broadcast event to all connected clients.
+        Status events are kept as 'latest only' — stale statuses are replaced,
+        never enqueued alongside newer statuses.
+        """
+        payload = json.dumps({"type": event_type, **data}, ensure_ascii=False)
+        is_status = event_type == "status"
+        with self._lock:
+            for q in self._clients:
+                qid = id(q)
+                if is_status:
+                    # Status: just update pending, don't enqueue (replaces stale status)
+                    self._pending_status[qid] = payload
+                else:
+                    # Non-status: flush pending status first, then enqueue
+                    status = self._pending_status.pop(qid, None)
+                    if status:
+                        self._put_or_drop(q, status)
+                    self._put_or_drop(q, payload)
+
+    def flush_status(self, q: asyncio.Queue) -> str | None:
+        """Return and clear the latest pending status for a queue (if any).
+        Called by SSE handler before each queue read to ensure the newest status
+        is sent ahead of all other events.
+        """
+        with self._lock:
+            return self._pending_status.pop(id(q), None)
 
 
 class Server:
@@ -86,17 +122,22 @@ class Server:
         self._start_lock = asyncio.Lock()
         self._status_cache_bytes = None
         self._status_cache_valid = False
-        self._chart_cache = {}
+        self._chart_cache: OrderedDict = OrderedDict()
         self._chart_cache_ttl = 10
-        self._chart_cache_max = 50
+        self._chart_cache_max = 10
         self.sse = SSEEmitter()
-        self._xiaomi_sessions = {}  # session_id -> XiaomiCloudClient for 2FA flow
+        self._xiaomi_sessions: dict[str, tuple[Any, asyncio.TimerHandle | None]] = {}  # session_id -> (client, timer)
+        self._start_time = time.time()
         self.history = PortHistory(
             db_path=self.config.server.history_db_path,
             retention_days=self.config.server.history_retention_days,
         )
         self.bemfa: BemfaClient | None = None
-        logging.getLogger().setLevel(LOG_LEVELS.get(self.config.server.log_level, logging.INFO))
+        effective_level = self.config.server.log_level
+        logging.getLogger().setLevel(LOG_LEVELS.get(effective_level, logging.INFO))
+        env_var = os.environ.get("CUKTECH_LOG_LEVEL")
+        source = "环境变量 CUKTECH_LOG_LEVEL" if env_var else "config.yaml"
+        _LOGGER.info("日志级别: %s (来源: %s)", effective_level, source)
 
     def mqtt_publish(self, topic, payload, retain=False):
         """Publish to all enabled MQTT clients (multiplex)."""
@@ -195,16 +236,37 @@ class Server:
         try:
             import yaml
             config_path = self._config_path()
+            cfg = {}
             if config_path.exists():
                 with open(config_path) as f:
                     cfg = yaml.safe_load(f) or {}
-                if cfg.get("bemfa", {}).get("modified"):
-                    cfg["bemfa"]["modified"] = False
-                    with open(config_path, "w") as f:
-                        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
-                    _LOGGER.info("Bemfa modified flag cleared")
+            if cfg.get("bemfa", {}).get("modified"):
+                cfg["bemfa"]["modified"] = False
+                # Atomic write: write to temp file then rename
+                tmp_path = config_path.with_suffix(".tmp")
+                with open(tmp_path, "w") as f:
+                    yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+                os.replace(tmp_path, config_path)
+                _LOGGER.info("Bemfa modified flag cleared")
         except Exception:
             _LOGGER.warning("Failed to clear bemfa modified flag", exc_info=True)
+
+    async def handle_health(self, request):
+        """GET /api/health - health check endpoint."""
+        ble_connected = self.ble.ctrl is not None and self.state.connected
+        mqtt_connected = self.mqtt_client is not None and self.mqtt_client.is_connected()
+        bemfa_connected = self.bemfa is not None and self.bemfa.is_connected
+        all_healthy = bool(ble_connected or self.config.server.port > 0)
+        return web.json_response({
+            "ok": True,
+            "healthy": all_healthy,
+            "components": {
+                "ble": ble_connected,
+                "mqtt": mqtt_connected,
+                "bemfa": bemfa_connected,
+            },
+            "uptime_ms": int((time.time() - getattr(self, '_start_time', time.time())) * 1000),
+        })
 
     async def handle_bemfa(self, request):
         """GET /api/bemfa - get Bemfa status."""
@@ -314,6 +376,19 @@ class Server:
                         server.ble.cmd_queue.put_nowait,
                         ("port", (port, action), None))
                     _LOGGER.info("MQTT port command: port=%s action=%s", port, action)
+                elif msg.topic == f"{server.config.mqtt.topic_prefix}/ble":
+                    enabled = payload.get("enabled")
+                    if enabled is None or not isinstance(enabled, bool):
+                        _LOGGER.warning("Invalid BLE command: 'enabled' must be a bool")
+                        return
+                    _LOGGER.info("MQTT BLE command: %s", "enable" if enabled else "disable")
+                    try:
+                        if enabled:
+                            asyncio.run_coroutine_threadsafe(server.ble.start(), server.loop)
+                        else:
+                            asyncio.run_coroutine_threadsafe(server.ble.request_stop(), server.loop)
+                    except Exception as e:
+                        _LOGGER.error("MQTT BLE cmd failed: %s", e)
             except (json.JSONDecodeError, ValueError, TypeError) as e:
                 _LOGGER.error("MQTT cmd parse error: %s", e)
             except Exception as e:
@@ -322,6 +397,8 @@ class Server:
         self.mqtt_client.on_message = on_mqtt_message
         self.mqtt_client.subscribe(f"{self.config.mqtt.topic_prefix}/set")
         self.mqtt_client.subscribe(f"{self.config.mqtt.topic_prefix}/port")
+        # /ble: HA "BLE连接" switch — enable/disable BLE connection
+        self.mqtt_client.subscribe(f"{self.config.mqtt.topic_prefix}/ble")
 
         _LOGGER.info("MQTT subscriptions ready")
 
@@ -352,9 +429,10 @@ class Server:
                 content_type="application/json",
             )
         data = await self.state.to_dict()
-        mqtt_connected = self.mqtt_client is not None and self.mqtt_client.is_connected()
-        data["mqtt_connected"] = mqtt_connected
-        self._status_cache_bytes = json.dumps(data, ensure_ascii=False).encode()
+        data["mqtt_connected"] = self.mqtt_client is not None and self.mqtt_client.is_connected()
+        self._status_cache_bytes = await asyncio.to_thread(
+            lambda: json.dumps(data, ensure_ascii=False).encode()
+        )
         self._status_cache_valid = True
         return web.Response(
             body=self._status_cache_bytes,
@@ -473,7 +551,7 @@ class Server:
                 await state.update_protocol_extend(new_val)
                 if hasattr(self, 'sse'):
                     self.sse.emit("protocol", {"switches": state.protocol_switches,
-                                                "protocol_extend": new_val})
+                                               "protocol_extend": new_val})
             return web.json_response(result)
         except Exception as e:
             _LOGGER.error("Protocol switch error: %s", e)
@@ -545,14 +623,18 @@ class Server:
         try:
             import yaml
             config_path = self._config_path()
+            cfg = {}
             if config_path.exists():
                 with open(config_path) as f:
                     cfg = yaml.safe_load(f) or {}
-                if "server" not in cfg:
-                    cfg["server"] = {}
-                cfg["server"]["log_level"] = level
-                with open(config_path, "w") as f:
-                    yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+            if "server" not in cfg:
+                cfg["server"] = {}
+            cfg["server"]["log_level"] = level
+            # Atomic write: write to temp file then rename
+            tmp_path = config_path.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
+                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+            os.replace(tmp_path, config_path)
         except Exception:
             _LOGGER.warning("Failed to persist log level to config.yaml", exc_info=True)
         _LOGGER.info("Log level changed to %s", level)
@@ -572,10 +654,10 @@ class Server:
 
         # Check cache
         now = time.time()
-        if cache_key in self._chart_cache:
-            cached_time, cached_etag, cached_body = self._chart_cache[cache_key]
+        entry = self._chart_cache.get(cache_key)
+        if entry:
+            cached_time, cached_etag, cached_body, _ = entry
             if now - cached_time < self._chart_cache_ttl:
-                # Check ETag
                 if_none_match = request.headers.get("If-None-Match")
                 if if_none_match == cached_etag:
                     return web.Response(status=304)
@@ -585,76 +667,65 @@ class Server:
                     headers={"ETag": cached_etag},
                 )
 
-        # Generate data
+        # Generate data in thread pool (strftime + loops + json.dumps + sha256 are all CPU-bound)
         now_ts = time.time()
         start_ts = now_ts - hours * 3600
         aligned_start = (int(start_ts) // interval) * interval
-
         use_date = hours > 12
         aligned_now = (int(now_ts) // interval) * interval
         epochs = list(range(aligned_start, aligned_now, interval))
+        raw_rows = self.history.query_history_multi(1, 4, hours, interval)
+
+        def _build_chart(epochs_, labels, raw_rows_):
+            port_data = {p: {} for p in range(1, 5)}
+            for row in raw_rows_:
+                port_data[row["port"]][int(row["bucket"])] = (
+                    row["power"], row["voltage"], row["current"]
+                )
+
+            n = len(labels)
+            power = [[0.0] * n for _ in range(5)]
+            voltage = [[0.0] * n for _ in range(4)]
+            current = [[0.0] * n for _ in range(4)]
+
+            for i, epoch in enumerate(epochs_):
+                total = 0.0
+                for port in range(1, 5):
+                    entry_ = port_data[port].get(epoch)
+                    if entry_ is not None:
+                        p, v, c = entry_
+                        power[port - 1][i] = round(p, 1)
+                        voltage[port - 1][i] = round(v, 2)
+                        current[port - 1][i] = round(c, 2)
+                        total += p
+                power[4][i] = round(total, 1)
+
+            port_names = ["C1", "C2", "C3", "A"]
+            result = {
+                "ok": True,
+                "labels": labels,
+                "datasets": {
+                    "power": [{"label": port_names[p], "data": power[p]} for p in range(4)]
+                           + [{"label": "Total", "data": power[4]}],
+                    "voltage": [{"label": port_names[p], "data": voltage[p]} for p in range(4)],
+                    "current": [{"label": port_names[p], "data": current[p]} for p in range(4)],
+                },
+            }
+            body = json.dumps(result, ensure_ascii=False).encode()
+            etag = hashlib.sha256(body).hexdigest()
+            return body, etag
+
         if use_date:
             all_labels = [time.strftime('%m-%d %H:%M', time.localtime(t)) for t in epochs]
         else:
             all_labels = [time.strftime('%H:%M', time.localtime(t)) for t in epochs]
 
-        raw_rows = self.history.query_history_multi(1, 4, hours, interval)
+        body, etag = await asyncio.to_thread(_build_chart, epochs, all_labels, raw_rows)
 
-        # Build port_data with epoch int as key, store tuple instead of dict
-        port_data = {p: {} for p in range(1, 5)}
-        for row in raw_rows:
-            port_data[row["port"]][int(row["bucket"])] = (
-                row["power"], row["voltage"], row["current"]
-            )
-
-        # Pre-allocate arrays for single-pass construction
-        n_labels = len(all_labels)
-        power_per_port = [[0.0] * n_labels for _ in range(5)]   # [0..3] ports, [4] total
-        voltage_per_port = [[0.0] * n_labels for _ in range(4)]
-        current_per_port = [[0.0] * n_labels for _ in range(4)]
-
-        # Single pass to fill all arrays
-        for i, epoch in enumerate(epochs):
-            total = 0.0
-            for port in range(1, 5):
-                entry = port_data[port].get(epoch)
-                if entry is not None:
-                    p, v, c = entry
-                    power_per_port[port - 1][i] = round(p, 1)
-                    voltage_per_port[port - 1][i] = round(v, 2)
-                    current_per_port[port - 1][i] = round(c, 2)
-                    total += p
-            power_per_port[4][i] = round(total, 1)
-
-        port_names = ["C1", "C2", "C3", "A"]
-        power_datasets = [{"label": port_names[p], "data": power_per_port[p]} for p in range(4)]
-        voltage_datasets = [{"label": port_names[p], "data": voltage_per_port[p]} for p in range(4)]
-        current_datasets = [{"label": port_names[p], "data": current_per_port[p]} for p in range(4)]
-
-        result = {
-            "ok": True,
-            "labels": all_labels,
-            "datasets": {
-                "power": power_datasets + [{"label": "Total", "data": power_per_port[4]}],
-                "voltage": voltage_datasets,
-                "current": current_datasets,
-            },
-        }
-
-        body = json.dumps(result, ensure_ascii=False).encode()
-        etag = hashlib.sha256(body).hexdigest()
-
-        # Update cache with cleanup
-        self._chart_cache[cache_key] = (now, etag, body)
+        # Update cache: OrderedDict O(1) eviction
+        self._chart_cache[cache_key] = (now, etag, body, now)
         if len(self._chart_cache) > self._chart_cache_max:
-            expired = [k for k, (t, _, _) in self._chart_cache.items() if now - t > self._chart_cache_ttl]
-            for k in expired:
-                del self._chart_cache[k]
-            # If still over max, remove oldest entries
-            if len(self._chart_cache) > self._chart_cache_max:
-                sorted_keys = sorted(self._chart_cache.keys(), key=lambda k: self._chart_cache[k][0])
-                for k in sorted_keys[:len(self._chart_cache) - self._chart_cache_max]:
-                    del self._chart_cache[k]
+            self._chart_cache.popitem(last=False)
 
         return web.Response(
             body=body,
@@ -698,9 +769,27 @@ class Server:
 
     async def handle_index(self, request):
         ua = request.headers.get('User-Agent', '')
-        if self.MOBILE_UA.search(ua):
-            return web.FileResponse(WEB_DIR / 'phone.html')
-        return web.FileResponse(WEB_DIR / 'index.html')
+        path = '/phone.html' if self.MOBILE_UA.search(ua) else '/index.html'
+        entry = _static_cache.get(path)
+        if entry:
+            accept_gzip = request.headers.get("Accept-Encoding", "").find("gzip") != -1
+            if accept_gzip and entry["gzipped"]:
+                body = entry["gzipped"]
+                headers = {
+                    "Content-Type": "text/html",
+                    "Content-Encoding": "gzip",
+                    "Content-Length": str(len(body)),
+                    "Cache-Control": "public, max-age=604800, immutable",
+                }
+            else:
+                body = entry["raw"]
+                headers = {
+                    "Content-Type": "text/html",
+                    "Content-Length": str(len(body)),
+                    "Cache-Control": "public, max-age=604800, immutable",
+                }
+            return web.Response(body=body, headers=headers)
+        return web.FileResponse(WEB_DIR / path.lstrip('/'))
 
     # ── Charge Session API ──
 
@@ -855,16 +944,27 @@ class Server:
 
         try:
             while True:
+                # Send latest pending status before each event (stale status never delivered)
+                status_msg = self.sse.flush_status(queue)
+                if status_msg:
+                    await response.write(f"data: {status_msg}\n\n".encode())
                 # Keepalive every 15s + event wait
                 try:
                     msg = await asyncio.wait_for(queue.get(), timeout=15.0)
                     await response.write(f"data: {msg}\n\n".encode())
                 except asyncio.TimeoutError:
                     await response.write(b": keepalive\n\n")
-        except (asyncio.CancelledError, ConnectionResetError, ConnectionError, BrokenPipeError):
-            pass
+        except asyncio.CancelledError:
+            _sse_log.debug("SSE handler cancelled")
+        except (ConnectionError, OSError, RuntimeError) as e:
+            _sse_log.debug("SSE client disconnected (%s: %s)", type(e).__name__, e)
+        except asyncio.TimeoutError:
+            _sse_log.debug("SSE keepalive timeout, closing connection")
+        except Exception as e:
+            _sse_log.warning("SSE handler error: %s: %s", type(e).__name__, e)
         finally:
             self.sse.remove_client(queue)
+            _sse_log.info("SSE client cleaned up (total: %d)", len(self.sse._clients))
         return response
 
     # ── Configuration API ──
@@ -942,6 +1042,16 @@ class Server:
                             continue  # Skip masked values, keep original
                         existing[section][k] = v
 
+            # Validate server.log_level value (prevent config corruption from frontend)
+            if "server" in existing and "log_level" in existing["server"]:
+                level = existing["server"]["log_level"]
+                if level not in LOG_LEVELS:
+                    _LOGGER.warning(
+                        "Ignoring invalid log_level '%s' in config save, fallback to 'info'",
+                        level,
+                    )
+                    existing["server"]["log_level"] = "info"
+
             # Detect bemfa name changes → set modified flag for topic re-registration
             if "bemfa" in config_data:
                 bemfa_existing = existing.get("bemfa", {})
@@ -955,14 +1065,17 @@ class Server:
                 if old_names != new_names:
                     bemfa_existing["modified"] = True
 
-            with open(config_path, "w") as f:
+            # Atomic write: write to temp file then rename
+            tmp_path = config_path.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
                 yaml.dump(existing, f, allow_unicode=True, default_flow_style=False)
+            os.replace(tmp_path, config_path)
 
             _LOGGER.info("Config saved to %s, restarting...", config_path)
 
-            # Schedule restart after response
+            # Schedule restart after response (use asyncio.sleep instead of deprecated call_later+ensure_future)
             loop = asyncio.get_running_loop()
-            loop.call_later(1.0, lambda: asyncio.ensure_future(self._restart()))
+            loop.create_task(self._delayed_restart())
 
             return web.json_response({"ok": True, "message": "配置已保存，服务将在 1 秒后重启"})
         except ImportError:
@@ -970,6 +1083,11 @@ class Server:
         except Exception as e:
             _LOGGER.error("Config save failed: %s", e)
             return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _delayed_restart(self):
+        """Delay 1 second then restart."""
+        await asyncio.sleep(1.0)
+        await self._restart()
 
     async def _restart(self):
         """Gracefully restart the server by re-exec-ing the process."""
@@ -993,6 +1111,15 @@ class Server:
 
     # ── Xiaomi Cloud API ──
 
+    def _cleanup_xiaomi_session(self, session_id: str):
+        """5 分钟超时清理：移除过期 Xiaomi session，释放相关资源。"""
+        entry = self._xiaomi_sessions.pop(session_id, None)
+        if entry:
+            client, timer = entry
+            if timer and not timer.cancelled():
+                timer.cancel()
+            _LOGGER.info("Xiaomi session %s timed out (5 min), cleaned up", session_id[:8])
+
     async def handle_xiaomi_login(self, request):
         """POST /api/xiaomi/login — start QR code login, return QR URL."""
         try:
@@ -1014,7 +1141,9 @@ class Server:
 
             result, client = await loop.run_in_executor(None, _start)
             session_id = _secrets.token_hex(16)
-            self._xiaomi_sessions[session_id] = client
+            # 5 分钟超时：启动延时清理，session 完成（beaconkey 获取）时取消
+            timer = loop.call_later(300, self._cleanup_xiaomi_session, session_id)
+            self._xiaomi_sessions[session_id] = (client, timer)
 
             return web.json_response({
                 "ok": True,
@@ -1039,9 +1168,10 @@ class Server:
         if not session_id:
             return web.json_response({"ok": False, "error": "缺少 session_id"}, status=400)
 
-        client = self._xiaomi_sessions.get(session_id)
-        if not client:
+        entry = self._xiaomi_sessions.get(session_id)
+        if not entry:
             return web.json_response({"ok": False, "error": "会话已过期，请重新获取二维码"}, status=400)
+        client, _timer = entry
 
         try:
             loop = asyncio.get_running_loop()
@@ -1051,7 +1181,10 @@ class Server:
                 return client.get_devices()
 
             devices = await loop.run_in_executor(None, _complete)
-            # Don't pop session here — beaconkey endpoint still needs it
+            # QR 扫码已完成，最耗时的阶段已过，取消超时定时器
+            if _timer and not _timer.cancelled():
+                _timer.cancel()
+            self._xiaomi_sessions[session_id] = (client, None)  # 清除定时器引用，保留 client 供 beaconkey 使用
 
             cuktech_devices = [d for d in devices if "njcuk" in d.model or "fitting" in d.model]
             all_devices = [{"did": d.did, "mac": d.mac, "token": d.token,
@@ -1082,9 +1215,10 @@ class Server:
         if not session_id or not did:
             return web.json_response({"ok": False, "error": "参数不完整"}, status=400)
 
-        client = self._xiaomi_sessions.get(session_id)
-        if not client:
+        entry = self._xiaomi_sessions.get(session_id)
+        if not entry:
             return web.json_response({"ok": False, "error": "会话已过期，请重新扫码"}, status=400)
+        client, _timer = entry
 
         try:
             loop = asyncio.get_running_loop()
@@ -1093,23 +1227,109 @@ class Server:
                 return client.get_beaconkey(did)
 
             ble_key = await loop.run_in_executor(None, _get_key)
-            # Clean up session after beaconkey is retrieved
+            # Session completed — cancel timeout timer and clean up
+            if _timer and not _timer.cancelled():
+                _timer.cancel()
             self._xiaomi_sessions.pop(session_id, None)
 
             if ble_key:
                 return web.json_response({"ok": True, "ble_key": ble_key})
             return web.json_response({"ok": False, "error": "未找到 BLE Key"}, status=404)
         except XiaomiCloudLoginError as e:
+            if _timer and not _timer.cancelled():
+                _timer.cancel()
             self._xiaomi_sessions.pop(session_id, None)
             return web.json_response({"ok": False, "error": str(e)}, status=400)
         except Exception as e:
             _LOGGER.error("Get beaconkey failed: %s", e)
+            if _timer and not _timer.cancelled():
+                _timer.cancel()
             self._xiaomi_sessions.pop(session_id, None)
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
 WEB_DIR = Path(__file__).parent / "web"
 _server = None
+
+# ── 静态文件缓存（启动时预加载 + 预压缩） ──
+_static_cache = {}
+_GZIP_TYPES = (".js", ".css", ".html", ".svg", ".json", ".txt")
+
+
+def _cache_static_files():
+    """递归扫描 static 目录，预加载并预压缩所有文件到内存。"""
+    static_dir = WEB_DIR / "static"
+    if not static_dir.is_dir():
+        return
+    for fpath in static_dir.rglob("*"):
+        if not fpath.is_file():
+            continue
+        rel = str(fpath.relative_to(static_dir))
+        key = f"/static/{rel}"
+        raw = fpath.read_bytes()
+        ext = fpath.suffix.lower()
+        # 按后缀推断 content-type
+        mime_map = {
+            ".js": "application/javascript",
+            ".css": "text/css",
+            ".html": "text/html",
+            ".png": "image/png",
+            ".ico": "image/x-icon",
+            ".svg": "image/svg+xml",
+            ".json": "application/json",
+            ".txt": "text/plain",
+            ".woff": "font/woff",
+            ".woff2": "font/woff2",
+            ".webp": "image/webp",
+        }
+        ct = mime_map.get(ext, "application/octet-stream")
+        # 预计算 gzip 版本
+        gzipped = None
+        if ext in _GZIP_TYPES and len(raw) >= 1024:
+            compressed = gzip.compress(raw)
+            if len(compressed) < len(raw):
+                gzipped = compressed
+        _static_cache[key] = {
+            "raw": raw,
+            "gzipped": gzipped,
+            "content_type": ct,
+        }
+    # 根目录 HTML 文件也加入缓存
+    for html_name in ("index.html", "phone.html", "config.html"):
+        html_path = WEB_DIR / html_name
+        if html_path.is_file():
+            raw = html_path.read_bytes()
+            compressed = gzip.compress(raw)
+            gzipped = compressed if len(compressed) < len(raw) else None
+            _static_cache[f"/{html_name}"] = {
+                "raw": raw,
+                "gzipped": gzipped,
+                "content_type": "text/html",
+            }
+
+
+async def handle_cached_static(request):
+    """从内存缓存响应静态文件，避免磁盘 I/O 和运行时 gzip。"""
+    entry = _static_cache.get(request.path)
+    if entry is None:
+        raise web.HTTPNotFound()
+    accept_gzip = request.headers.get("Accept-Encoding", "").find("gzip") != -1
+    if accept_gzip and entry["gzipped"]:
+        body = entry["gzipped"]
+        headers = {
+            "Content-Type": entry["content_type"],
+            "Content-Encoding": "gzip",
+            "Content-Length": str(len(body)),
+            "Cache-Control": "public, max-age=604800, immutable",
+        }
+    else:
+        body = entry["raw"]
+        headers = {
+            "Content-Type": entry["content_type"],
+            "Content-Length": str(len(body)),
+            "Cache-Control": "public, max-age=604800, immutable",
+        }
+    return web.Response(body=body, headers=headers)
 
 
 def get_server():
@@ -1146,8 +1366,50 @@ async def cors_middleware(request, handler):
 
 
 @web.middleware
+async def request_size_limit_middleware(request, handler):
+    """Reject requests with body exceeding MAX_REQUEST_BODY_SIZE."""
+    if request.method in ("POST", "PUT", "PATCH"):
+        content_length = request.headers.get("Content-Length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_REQUEST_BODY_SIZE:
+                    return web.json_response(
+                        {"ok": False, "error": "Request body too large"},
+                        status=413,
+                    )
+            except ValueError:
+                pass
+    return await handler(request)
+
+
+@web.middleware
+async def request_timeout_middleware(request, handler):
+    """Apply a per-request timeout (30s for API, 120s for SSE)."""
+    if request.path == "/api/events":
+        timeout = 120.0
+    elif request.path.startswith("/api/"):
+        timeout = 30.0
+    else:
+        # Static files / HTML — no timeout
+        return await handler(request)
+    try:
+        return await asyncio.wait_for(handler(request), timeout=timeout)
+    except asyncio.TimeoutError:
+        _LOGGER.warning("Request timeout: %s %s", request.method, request.path)
+        return web.json_response(
+            {"ok": False, "error": "Request timeout"},
+            status=504,
+        )
+
+
+@web.middleware
 async def gzip_middleware(request, handler):
     response = await handler(request)
+    # 已预压缩的静态文件（Content-Encoding 已设置）跳过
+    if response.headers.get("Content-Encoding") == "gzip":
+        return response
+    if not hasattr(response, 'body'):
+        return response
     if request.headers.get("Accept-Encoding", "").find("gzip") == -1:
         return response
     if response.content_length is not None and response.content_length < 1024:
@@ -1155,8 +1417,8 @@ async def gzip_middleware(request, handler):
     if response.content_type and "text" not in response.content_type and "json" not in response.content_type:
         return response
     body = response.body
-    if isinstance(body, bytes):
-        compressed = gzip.compress(body)
+    if isinstance(body, bytes) and len(body) >= 1024:
+        compressed = await asyncio.to_thread(gzip.compress, body)
         if len(compressed) < len(body):
             response.body = compressed
             response.headers["Content-Encoding"] = "gzip"
@@ -1167,6 +1429,9 @@ async def gzip_middleware(request, handler):
 @web.middleware
 async def cache_middleware(request, handler):
     response = await handler(request)
+    # 已由 handle_cached_static / handle_index 设置缓存头的文件跳过
+    if response.headers.get("Cache-Control"):
+        return response
     if request.path.startswith("/static/"):
         if request.path.endswith((".js", ".css", ".png", ".ico", ".woff", ".woff2")):
             if os.environ.get("CUKTECH_ENV") == "development":
@@ -1176,10 +1441,18 @@ async def cache_middleware(request, handler):
     return response
 
 
-app = web.Application(middlewares=[cors_middleware, gzip_middleware, cache_middleware])
+app = web.Application(middlewares=[
+    request_size_limit_middleware,
+    cors_middleware,
+    gzip_middleware,
+    cache_middleware,
+    request_timeout_middleware,
+])
 app.router.add_get("/", lambda r: get_server().handle_index(r))
-app.router.add_get("/phone.html", lambda r: web.FileResponse(WEB_DIR / "phone.html"))
-app.router.add_get("/config.html", lambda r: web.FileResponse(WEB_DIR / "config.html"))
+app.router.add_get("/phone.html", handle_cached_static)
+app.router.add_get("/config.html", handle_cached_static)
+app.router.add_get("/static/{tail:.*}", handle_cached_static)
+app.router.add_get("/api/health", lambda r: get_server().handle_health(r))
 app.router.add_get("/api/status", lambda r: get_server().handle_status(r))
 app.router.add_post("/api/set", lambda r: get_server().handle_set(r))
 app.router.add_post("/api/port", lambda r: get_server().handle_port(r))
@@ -1200,10 +1473,14 @@ app.router.add_post("/api/config", lambda r: get_server().handle_config_save(r))
 app.router.add_post("/api/xiaomi/login", lambda r: get_server().handle_xiaomi_login(r))
 app.router.add_post("/api/xiaomi/qr/complete", lambda r: get_server().handle_xiaomi_qr_complete(r))
 app.router.add_post("/api/xiaomi/beaconkey", lambda r: get_server().handle_xiaomi_beaconkey(r))
-app.router.add_static("/static", WEB_DIR / "static", show_index=False)
 
 
 async def on_startup(app_):
+    _cache_static_files()
+    _LOGGER.info("Static files cached: %d files (%.1f KB raw / %.1f KB gzip)",
+                 len(_static_cache),
+                 sum(len(v["raw"]) for v in _static_cache.values()) / 1024,
+                 sum(len(v["gzipped"] or v["raw"]) for v in _static_cache.values()) / 1024)
     s = get_server()
     async with s._start_lock:
         s.loop = asyncio.get_running_loop()
@@ -1227,7 +1504,7 @@ async def on_startup(app_):
 async def on_shutdown(app_):
     _LOGGER.info("Shutting down...")
     s = get_server()
-    # Close active sessions first (fast, sync DB write)
+    # Close active sessions first
     s.ble._close_active_sessions()
     # BLE disconnect with timeout
     try:
@@ -1260,13 +1537,4 @@ app.on_shutdown.append(on_shutdown)
 
 if __name__ == "__main__":
     s = get_server()
-
-    async def _on_startup(app_):
-        # Register SIGTERM handler inside event loop for safe asyncio calls
-        loop = asyncio.get_running_loop()
-        if sys.platform != "win32":
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                loop.add_signal_handler(sig, lambda: asyncio.ensure_future(app.shutdown()))
-
-    app.on_startup.append(_on_startup)
     web.run_app(app, host="0.0.0.0", port=s.config.server.port)

@@ -71,6 +71,27 @@ let state = {
     protocolSwitches: {},
     protocolExtend: 0,
 };
+// Real-time chart data buffer: {ts, c1, c2, c3, a}[]
+let phoneChartData = [];
+const PHONE_CHART_MAX = 150;   // 显示最近 150 个点 ≈ 5 分钟（2s 间隔）
+const PHONE_CHART_BUF = 300;   // 缓冲区保留 300 个点 ≈ 10 分钟
+function phoneSnapshot() {
+    return {
+        ts: Date.now(),
+        c1: state.bleConnected && state.ports.c1.enabled ? (state.ports.c1.w || 0) : 0,
+        c2: state.bleConnected && state.ports.c2.enabled ? (state.ports.c2.w || 0) : 0,
+        c3: state.bleConnected && state.ports.c3.enabled ? (state.ports.c3.w || 0) : 0,
+        a: state.bleConnected && state.ports.a.enabled ? (state.ports.a.w || 0) : 0,
+    };
+}
+function phoneBuildTimeLabels(buf, offset, count) {
+    return buf.slice(offset, offset + count).map(e => {
+        const d = new Date(e.ts);
+        return String(d.getHours()).padStart(2,'0') + ':' +
+               String(d.getMinutes()).padStart(2,'0') + ':' +
+               String(d.getSeconds()).padStart(2,'0');
+    });
+}
 
 // ── API Fetch ──
 async function fetchStatus() {
@@ -304,23 +325,12 @@ function renderRateCard() {
 }
 
 let portCharts = {};
+let phoneChartDebounce = null;
 function renderCharts() {
-    let totalW = 0;
-    // When BLE disconnected, chart shows 0 instead of stale data
-    if (state.bleConnected) {
-        for (const p of Object.values(state.ports)) {
-            if (p.enabled) totalW += p.w;
-        }
-    }
-    if (!state._totalHistory) state._totalHistory = [];
-    if (totalW > 0 || state._totalHistory.length > 0) {
-        state._totalHistory.push(totalW);
-        if (state._totalHistory.length > 30) state._totalHistory.shift();
-    }
-
     // Mini bar chart
     const miniChart = document.getElementById('miniChart');
     if (miniChart) {
+        if (!state._totalHistory) state._totalHistory = [];
         const maxVal = Math.max(1, ...state._totalHistory);
         let miniHtml = '';
         for (const v of state._totalHistory) {
@@ -330,53 +340,54 @@ function renderCharts() {
         miniChart.innerHTML = miniHtml;
     }
 
-    // Update port history — push 0 when disconnected
-    let hasData = false;
-    for (const key of PORT_KEYS) {
-        const p = state.ports[key];
-        if (state.bleConnected && p.enabled && p.w > 0) hasData = true;
-    }
-    if (hasData || state.history.c1.length > 0) {
-        for (const key of PORT_KEYS) {
-            const p = state.ports[key];
-            const w = (state.bleConnected && p.enabled && p.w > 0) ? p.w : 0;
-            state.history[key].push(w);
-            if (state.history[key].length > 30) state.history[key].shift();
-        }
-    }
-
-    // Combined chart: all 4 ports
+    // Combined chart with right-to-left effect + 时间标签
     const combinedCanvas = document.getElementById('chartCombined');
     if (combinedCanvas) {
-        // 计算动态峰值
+        // 计算动态峰值（使用实际数据，不计填充的零值）
         let currentPeak = 0;
-        for (const key of PORT_KEYS) {
-            for (const v of state.history[key]) {
-                if (v > currentPeak) currentPeak = v;
+        for (const e of phoneChartData) {
+            for (const key of PORT_KEYS) {
+                if (e[key] > currentPeak) currentPeak = e[key];
             }
         }
         const peakPower = currentPeak > 0 ? currentPeak * 1.18 : 60;
 
+        // 从 phoneChartData 构建右对齐填充数据 + 时间标签
+        function buildChartData() {
+            const showBuf = phoneChartData.slice(-PHONE_CHART_MAX);
+            const padding = PHONE_CHART_MAX - showBuf.length;
+            const padLabels = new Array(padding).fill('--:--:--');
+            const padZeros = new Array(padding).fill(0);
+            const realLabels = phoneBuildTimeLabels(phoneChartData, Math.max(0, phoneChartData.length - showBuf.length), showBuf.length);
+            const labels = [...padLabels, ...realLabels];
+            const datasets = PORT_KEYS.map(key => ({
+                data: [...padZeros, ...showBuf.map(e => e[key])]
+            }));
+            return { labels, datasets };
+        }
+
         if (portCharts.combined) {
             // Update existing chart in place (no flicker)
             const chart = portCharts.combined;
-            chart.data.labels = state.history.c1.map((_, i) => i);
+            const { labels, datasets } = buildChartData();
+            chart.data.labels = labels;
             PORT_KEYS.forEach((key, i) => {
-                chart.data.datasets[i].data = state.history[key];
+                chart.data.datasets[i].data = datasets[i].data;
             });
             chart.options.scales.y.max = peakPower;
             chart.update('none');
             chart._peakData = { peakPower, currentPeak, isDark };
             drawPeakLines(chart);
         } else {
-            // First render: create chart
+            // First render: create chart with right-to-left padding
+            const { labels, datasets } = buildChartData();
             portCharts.combined = new Chart(combinedCanvas, {
                 type: 'line',
                 data: {
-                    labels: state.history.c1.map((_, i) => i),
-                    datasets: PORT_KEYS.map(key => ({
+                    labels: labels,
+                    datasets: PORT_KEYS.map((key, i) => ({
                         label: PORT_NAMES[key],
-                        data: state.history[key],
+                        data: datasets[i].data,
                         borderColor: PORT_COLORS[key],
                         borderWidth: 1.5,
                         tension: 0.4,
@@ -385,11 +396,11 @@ function renderCharts() {
                     }))
                 },
                 options: {
-                    responsive: true, maintainAspectRatio: false, animation: { duration: 300 },
+                    responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
                     interaction: { intersect: false, mode: 'index' },
                     plugins: { legend: { display: false } },
                     scales: {
-                        x: { display: false },
+                        x: { display: true, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#888', maxTicksLimit: 8, font: { size: 9 }, maxRotation: 0 } },
                         y: { display: false, min: 0, max: peakPower },
                     }
                 }
@@ -581,11 +592,57 @@ function toggleTheme() {
     renderCharts();
 }
 
+// ── 数据推送（仅定时器调用，避免去抖与定时器重复写入） ──
+function phonePushData() {
+    let totalW = 0;
+    for (const p of Object.values(state.ports)) {
+        if (p.enabled) totalW += p.w;
+    }
+    if (!state._totalHistory) state._totalHistory = [];
+    if (totalW > 0 || state._totalHistory.length > 0) {
+        state._totalHistory.push(totalW);
+        if (state._totalHistory.length > 30) state._totalHistory.shift();
+    }
+    let hasData = false;
+    for (const key of PORT_KEYS) {
+        if (state.bleConnected && state.ports[key].enabled && state.ports[key].w > 0) hasData = true;
+    }
+    if (phoneChartData.length > 0 || hasData) {
+        phoneChartData.push(phoneSnapshot());
+        if (phoneChartData.length > PHONE_CHART_BUF) phoneChartData.shift();
+    }
+}
+
 // ── Init ──
 renderAll();
 initPhoneSSE();
-// Chart decoupled from SSE — update every 2s instead of every ~1s push
-setInterval(renderCharts, 2000);
+// 定时器：先 push 数据再渲染（去抖只渲染不 push，杜绝重复点）
+setInterval(() => { phonePushData(); renderCharts(); }, 2000);
+// 安全兜底：每 30s 轮询 /api/status 校正因 SSE 队列丢事件导致的连接状态偏差
+setInterval(async () => {
+    try {
+        const res = await fetch(`${API_BASE}/api/status`);
+        const data = await res.json();
+        const realConn = data.connected && data.authenticated;
+        if (realConn !== state.bleConnected) {
+            state.bleConnected = realConn;
+            updateConnectionUI();
+            if (realConn && data.ports) {
+                for (const [id, port] of Object.entries(data.ports)) {
+                    const key = API_PORT_MAP[id];
+                    if (key && state.ports[key]) {
+                        state.ports[key].v = port.voltage || 0;
+                        state.ports[key].a = port.current || 0;
+                        state.ports[key].w = port.power || 0;
+                        state.ports[key].enabled = port.enabled !== false;
+                        state.ports[key].protocol = port.protocol || 'idle';
+                    }
+                }
+                renderAll();
+            }
+        }
+    } catch (e) {}
+}, 30000);
 
 // ── SSE (Server-Sent Events) ──
 function initPhoneSSE() {
@@ -693,7 +750,13 @@ function applyPortUpdate(portId, portData) {
     if (!isRecentLocal()) state.ports[key].enabled = portData.enabled !== false;
     state.ports[key].protocol = portData.protocol || 'idle';
     state.ports[key].status_raw = portData.status_raw;
-    // Incremental render — skip chart (decoupled to 2s timer)
+    // 500ms 去抖刷新组合图表（数据到达时及时更新，稳定期由 2s 定时器补充）
+    if (phoneChartDebounce) clearTimeout(phoneChartDebounce);
+    phoneChartDebounce = setTimeout(() => {
+        phoneChartDebounce = null;
+        renderCharts();
+    }, 500);
+    // Incremental render — skip chart (decoupled to debounce+2s timer)
     renderDeviceArea();
     renderRateCard();
     renderPowerDist();

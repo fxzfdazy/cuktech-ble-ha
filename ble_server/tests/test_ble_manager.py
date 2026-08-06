@@ -60,31 +60,40 @@ class TestBLEManagerInit:
 
 
 class TestReconnectDelay:
-    """Test exponential backoff delay calculation."""
+    """Test exponential backoff delay calculation with jitter."""
 
     def test_initial_delay(self):
-        """Test initial delay is base delay."""
+        """Test initial delay is base delay (no jitter for delay <= 1.0)."""
         mgr = make_manager()
         mgr._reconnect_attempts = 0
         assert mgr._get_reconnect_delay() == 1.0
 
     def test_exponential_increase(self):
-        """Test delay increases exponentially."""
+        """Test delay increases exponentially within jitter range."""
         mgr = make_manager()
         mgr._reconnect_attempts = 3
-        assert mgr._get_reconnect_delay() == 8.0
+        # base = 2^3 = 8, jitter ±25% = ±2.0 → range [6.0, 10.0]
+        for _ in range(50):
+            delay = mgr._get_reconnect_delay()
+            assert 6.0 <= delay <= 10.0, f"delay {delay} outside range [6.0, 10.0]"
 
     def test_max_delay_cap(self):
-        """Test delay is capped at max."""
+        """Test delay is capped at max (with jitter)."""
         mgr = make_manager()
         mgr._reconnect_attempts = 10
-        assert mgr._get_reconnect_delay() == 300.0
+        # base capped at 300, jitter ±25% = ±75 → range [225, 375]
+        for _ in range(50):
+            delay = mgr._get_reconnect_delay()
+            assert 225 <= delay <= 375, f"delay {delay} outside range [225, 375]"
 
     def test_attempts_capped(self):
         """Test attempts are capped at 10 for exponent."""
         mgr = make_manager()
         mgr._reconnect_attempts = 100
-        assert mgr._get_reconnect_delay() == 300.0
+        # Same as attempts=10 → range [225, 375]
+        for _ in range(50):
+            delay = mgr._get_reconnect_delay()
+            assert 225 <= delay <= 375, f"delay {delay} outside range [225, 375]"
 
 
 class TestPublishMethods:
@@ -200,6 +209,9 @@ class TestHandleMultiframe:
         mgr.ctrl = MagicMock()
         mgr.ctrl.client = MagicMock()
         mgr.ctrl.client.write_gatt_char = AsyncMock()
+        # Decrypt-failure recovery shouldn't interfere with the drain loop test:
+        # stub out inline processing so the drain only exercises wait_notify.
+        mgr._try_process_inline_frame = AsyncMock()
         call_count = 0
         async def fake_wait_notify(name, timeout=5.0):
             nonlocal call_count
@@ -492,6 +504,8 @@ class TestMultiframeBoundary:
         mgr.ctrl = MagicMock()
         mgr.ctrl.client = MagicMock()
         mgr.ctrl.client.write_gatt_char = AsyncMock()
+        # Stub inline processing so decrypt-failure recovery doesn't abort the drain.
+        mgr._try_process_inline_frame = AsyncMock()
         call_count = 0
 
         async def fake_wait_notify(name, timeout=5.0):
@@ -543,7 +557,7 @@ class TestDecryptFailure:
 
     @pytest.mark.asyncio
     async def test_decrypt_failure_count_increments(self):
-        """Test _decrypt_failures increments on repeated decrypt failures."""
+        """Test _decrypt_failures increments and triggers recovery at threshold 3."""
         mgr = make_manager()
         mgr.ctrl = MagicMock()
         mgr.ctrl.client = MagicMock()
@@ -557,8 +571,9 @@ class TestDecryptFailure:
         await mgr._handle_inline_data(data)
         assert mgr._decrypt_failures == 2
 
-        await mgr._handle_inline_data(data)
-        assert mgr._decrypt_failures == 3
+        # 3rd consecutive failure crosses the threshold → session stale raised
+        with pytest.raises(ConnectionError):
+            await mgr._handle_inline_data(data)
 
     @pytest.mark.asyncio
     async def test_decrypt_failure_resets_on_success(self):
