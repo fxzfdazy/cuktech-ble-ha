@@ -322,29 +322,76 @@ select option {
 }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
-/* ── Charge History ── */
-select, .charge-select {
-    background: var(--card-bg, transparent);
-    color: var(--text-dim);
-    border-color: var(--card-border, rgba(255,255,255,0.15));
-}
-select option {
-    background: var(--card-bg, #252525);
-    color: var(--text-dim);
-}
-.mini-stat {
-    text-align: center;
-    padding: 8px 4px;
-    background: var(--card-bg, rgba(255,255,255,0.03));
-    border-radius: 8px;
-}
-.mini-stat-value {
-    font-size: 18px;
-    font-weight: 700;
-    color: var(--text);
-}
-.mini-stat-label {
-    font-size: 11px;
-    color: var(--text-dim);
-    margin-top: 2px;
-}
+.current-charge-card { margin-bottom: 8px; }
+.charge-box { padding: 12px 14px; border-radius: 10px; border: 1px solid var(--card-border); background: var(--card-bg); }
+.charge-box-idle { display: flex; align-items: center; gap: 8px; }
+.charge-box-idle .dot { width: 8px; height: 8px; border-radius: 50%; opacity: 0.5; }
+.charge-box-idle .label { font-size: 13px; color: var(--text-dim); }
+.charge-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 2px 8px; margin-bottom: 2px; }
+.charge-head-left { display: flex; align-items: center; gap: 8px; }
+.charge-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--success, #34C759); animation: pulse 1.5s infinite; }
+.charge-name { font-size: 14px; font-weight: 600; }
+.charge-proto { font-size: 11px; color: var(--accent); margin-left: 6px; }
+.charge-time { font-size: 12px; color: var(--text-dim); }
+.charge-body { display: flex; justify-content: space-between; align-items: flex-end; gap: 8px; }
+.charge-energy { flex: 1; min-width: 0; }
+.charge-powers { display: flex; gap: 14px; align-items: flex-end; }
+.charge-metric-label { font-size: 11px; color: var(--text-dim); }
+.charge-metric-value { font-size: 22px; font-weight: 700; color: var(--text); }
+.charge-metric-unit { font-size: 12px; color: var(--text-dim); font-weight: 400; }
+.charge-power { text-align: right; }
+.charge-power-value { font-size: 16px; font-weight: 600; color: var(--success, #34C759); }
+.charge-duration { margin-left: 8px; font-size: 12px; color: var(--text-dim); }
+
+.history-group + .history-group { margin-top: 10px; }
+.history-group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.history-group-head .dot { width: 8px; height: 8px; border-radius: 50%; }
+.history-group-name { font-size: 13px; font-weight: 600; color: var(--text); }
+.history-group-count { font-size: 11px; color: var(--text-dim); }
+.history-empty { text-align: center; color: var(--text-dim); padding: 10px; font-size: 12px; }
+.charge-item { display: flex; align-items: center; justify-content: space-between; padding: 9px 10px; border: 1px solid var(--card-border); border-radius: 8px; margin-bottom: 6px; cursor: pointer; background: var(--card-bg); }
+.charge-item:hover { border-color: var(--accent); }
+.charge-item-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.charge-item-row { display: flex; align-items: center; }
+.charge-item-time { font-size: 12px; color: var(--text-dim); }
+.charge-item-dur { font-size: 11px; color: var(--text-dim); }
+.charge-item-right { text-align: right; flex-shrink: 0; margin-left: 8px; }
+.charge-item-wh { font-size: 14px; font-weight: 600; }
+.charge-item-peak { font-size: 10px; color: var(--text-dim); }
+.charge-badge { font-size: 10px; color: var(--success, #34C759); border: 1px solid var(--success, #34C759); border-radius: 4px; padding: 0 4px; margin-left: 6px; }
+
+.charge-view-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.charge-view-title { font-size: 14px; color: var(--text); }
+.btn-close { background: rgba(255,59,48,0.1); border: 1px solid rgba(255,59,48,0.3); color: #FF3B30; border-radius: 8px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
+.btn-close-sm { background: rgba(255,59,48,0.1); border: 1px solid rgba(255,59,48,0.3); color: #FF3B30; border-radius: 8px; padding: 8px 20px; font-size: 12px; cursor: pointer; }
+
+/* 当前卡片累计电量旁的 mAh 小字 */
+.charge-metric-sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+/* 当前卡片迷你功率曲线容器：固定高度防轮询重建时跳动；上方留白给瓦时按钮，避免遮住功率行 */
+.charge-mini-chart { position: relative; height: 100px; margin-top: 22px; }
+.charge-mini-hint { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; font-size: 11px; color: var(--text-dim); opacity: 0.7; }
+.mini-wh-toggle { position: absolute; top: -16px; right: 0; z-index: 2; padding: 0 8px; font-size: 10px; line-height: 16px; border-radius: 8px; border: 1px solid var(--border, rgba(128,128,128,0.35)); background: var(--card-bg, transparent); color: var(--text-dim); cursor: pointer; }
+/* 截止展示态：圆点停止呼吸、功率数值置灰、橙色截止徽标 */
+.charge-box-ended .charge-dot { animation: none; background: var(--text-dim); }
+.charge-box-ended .charge-power-value { color: var(--text-dim); }
+.charge-ended-tag { margin-left: 8px; font-size: 10px; color: #FF9500; border: 1px solid rgba(255,149,0,0.5); border-radius: 4px; padding: 0 4px; white-space: nowrap; }
+.mini-wh-toggle.active { color: rgb(255,152,0); border-color: rgba(255,152,0,0.55); }
+/* 未充电占位：圆点与文案同行，记录未开启时下方提示 */
+.charge-idle-row { display: flex; align-items: center; gap: 8px; }
+.charge-idle-hint { font-size: 11px; color: var(--text-dim); opacity: 0.85; margin-top: 3px; padding-left: 16px; }
+/* 历史视图头部清理按钮 */
+.btn-clear { background: rgba(255,59,48,0.1); border: 1px solid rgba(255,59,48,0.3); color: #FF3B30; border-radius: 8px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+/* 详情视图：头部行、数据格、图表 */
+.sd-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.sd-head-left { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.sd-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.sd-duration { font-size: 12px; color: var(--text-dim); }
+.btn-back { background: rgba(255,255,255,0.06); border: 1px solid var(--card-border); color: var(--text-dim); border-radius: 8px; padding: 4px 12px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+.sd-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.sd-row2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 6px; }
+.sd-cell { text-align: center; padding: 8px 4px; background: rgba(255,255,255,0.03); border-radius: 8px; }
+.sd-cell-value { font-size: 16px; font-weight: 700; color: var(--text); }
+.sd-cell-unit { font-size: 11px; color: var(--text-dim); font-weight: 400; }
+.sd-cell-mah { font-size: 11px; color: var(--text-dim); margin-top: 2px; min-height: 13px; }
+.sd-cell-label { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+.sd-chart { position: relative; height: 176px; margin-top: 10px; }

@@ -41,7 +41,7 @@ PIID_NAMES = {
 # PIID display values
 PIID_DISPLAY = {
     5: {1: "AI模式", 2: "数码生态", 3: "单口模式", 4: "均衡模式"},
-    6: {0: "5分钟", 1: "1分钟", 2: "10分钟", 3: "30分钟", 4: "常亮", 5: "1分钟(设备固件: value=5 也表示1分钟)"},
+    6: {1: "5分钟", 2: "10分钟", 3: "30分钟", 4: "常亮", 5: "1分钟"},
     7: None,  # PIID 7 = bit flags (SCP/MiPPS/UFCS), 不需要显示映射
     13: {0: "English", 1: "中文"},
     15: {0: "关闭", 1: "开启"},
@@ -52,7 +52,7 @@ PIID_DISPLAY = {
 # Select options for each setting
 SELECT_PIIDS = {
     5: {"name": "场景模式", "icon": "mdi:cog", "options": ["AI模式", "数码生态", "单口模式", "均衡模式"]},
-    6: {"name": "息屏时间", "icon": "mdi:monitor", "options": ["5分钟", "1分钟", "10分钟", "30分钟", "常亮"]},
+    6: {"name": "息屏时间", "icon": "mdi:monitor", "options": ["1分钟", "5分钟", "10分钟", "30分钟", "常亮"]},
     13: {"name": "语言", "icon": "mdi:translate", "options": ["English", "中文"]},
 }
 

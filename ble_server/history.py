@@ -26,6 +26,19 @@ class PortHistory:
         self._db_lock = threading.Lock()  # 保护所有读写操作
         self._last_cleanup = 0
         self._last_wal_checkpoint = 0
+        # charge_points 写入节流：key=session_id，value=上次写入时间戳
+        self._last_point_ts: dict = {}
+        # port_history 写入节流：key=port，value=上次写入时间戳
+        self._last_port_ts: dict = {}
+        # 降采样间隔（秒），可由 set_point_interval 修改
+        self._point_interval = 30
+        # 内存写入缓冲：port_history 与 charge_points 先进内存，后台线程批量落盘
+        self._flush_interval = 5
+        self._pending_port: list = []
+        self._pending_points: list = []
+        self._flush_lock = threading.Lock()
+        self._flush_stop = threading.Event()
+        self._flush_thread: Optional[threading.Thread] = None
 
     def connect(self):
         """Open database connection and create tables."""
@@ -38,13 +51,22 @@ class PortHistory:
         self._conn.execute("PRAGMA wal_autocheckpoint=1000")  # checkpoint every 1000 pages
         self._create_tables()
         self._cleanup_old_data()
+        # 启动后台批量落盘线程
+        self._flush_stop.clear()
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True, name="history_flush")
+        self._flush_thread.start()
         _LOGGER.info("History database connected: %s", self.db_path)
 
     def close(self):
         """Close database connection with checkpoint and graceful shutdown."""
+        # 先停止 flush 线程并落盘剩余缓冲
+        self._flush_stop.set()
+        if self._flush_thread:
+            self._flush_thread.join(timeout=10)
+            self._flush_thread = None
+        self._flush()
         if self._conn:
             try:
-                # Try to checkpoint WAL before closing
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception:
                 pass
@@ -102,12 +124,13 @@ class PortHistory:
             CREATE INDEX IF NOT EXISTS idx_charge_points_session ON charge_points(session_id);
             CREATE INDEX IF NOT EXISTS idx_charge_points_timestamp ON charge_points(timestamp);
         """)
-        # Migration: add protocol column to charge_points if missing
+        # 迁移：旧库 charge_points 缺 protocol 列时补上
         try:
             self._conn.execute("SELECT protocol FROM charge_points LIMIT 1")
         except sqlite3.OperationalError:
             self._conn.execute("ALTER TABLE charge_points ADD COLUMN protocol TEXT DEFAULT ''")
             self._conn.commit()
+        self._conn.commit()
 
     def _checkpoint_wal(self):
         """Run WAL checkpoint if enough pages have accumulated."""
@@ -116,48 +139,84 @@ class PortHistory:
         except Exception:
             pass
 
+    def set_point_interval(self, sec: int):
+        """设置 charge_points 降采样间隔（秒）。"""
+        if sec >= 1:
+            self._point_interval = sec
+
+    def _flush_loop(self):
+        """后台定时把内存缓冲批量写入数据库。"""
+        while not self._flush_stop.is_set():
+            if self._flush_stop.wait(self._flush_interval):
+                break
+            self._flush()
+
+    def _flush(self):
+        """把内存缓冲批量写入数据库（单次 commit）。"""
+        with self._flush_lock:
+            if not self._pending_port and not self._pending_points:
+                return
+            port_rows = self._pending_port[:]
+            point_rows = self._pending_points[:]
+            self._pending_port.clear()
+            self._pending_points.clear()
+        if not self._conn:
+            return
+        with self._db_lock:
+            try:
+                if port_rows:
+                    self._conn.executemany(
+                        """INSERT INTO port_history (timestamp, port, voltage, current, power, active, protocol)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""", port_rows)
+                if point_rows:
+                    self._conn.executemany(
+                        """INSERT INTO charge_points (session_id, timestamp, voltage, current, power, protocol)
+                           VALUES (?, ?, ?, ?, ?, ?)""", point_rows)
+                self._conn.commit()
+                now = time.time()
+                if now - self._last_cleanup > 3600:
+                    self._cleanup_old_data()
+                    self._last_cleanup = now
+                if now - self._last_wal_checkpoint > 300:
+                    self._checkpoint_wal()
+                    self._last_wal_checkpoint = now
+            except Exception as e:
+                _LOGGER.error("Flush failed: %s", e)
+
+    def _flush_before_read(self):
+        """查询前调用，确保内存缓冲已落盘，读到最新数据。"""
+        self._flush()
+
     def _cleanup_old_data(self):
         """Remove data older than retention period."""
         cutoff = time.time() - (self.retention_days * 86400)
+        # 清理超过保留期的端口实时历史
         self._conn.execute("DELETE FROM port_history WHERE timestamp < ?", (cutoff,))
-        # Clean charge_points for sessions older than retention
+        # 清理已结束且超过保留期的会话明细点
         self._conn.execute(
             """DELETE FROM charge_points WHERE session_id IN
                (SELECT id FROM charge_sessions WHERE end_time IS NOT NULL AND end_time < ?)""",
             (cutoff,))
         self._conn.commit()
 
+    # ── Port History (功率图表 / 端口统计 / CSV 导出) ──
+
     def record_port_data(self, port: int, data: dict):
-        """Record port data to database (synchronous, called from async via executor)."""
+        """记录端口实时数据（按采样间隔降采样，写入内存缓冲批量落盘）。"""
         if not self._conn:
             return
-        with self._db_lock:
-            try:
-                self._conn.execute(
-                    """INSERT INTO port_history (timestamp, port, voltage, current, power, active, protocol)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        time.time(),
-                        port,
-                        data.get("voltage"),
-                        data.get("current"),
-                        data.get("power"),
-                        1 if data.get("active") else 0,
-                        data.get("protocol"),
-                    )
-                )
-                self._conn.commit()
-                # Periodic cleanup every hour
-                now = time.time()
-                if now - self._last_cleanup > 3600:
-                    self._cleanup_old_data()
-                    self._last_cleanup = now
-                # Periodic WAL checkpoint every 5 minutes
-                if now - self._last_wal_checkpoint > 300:
-                    self._checkpoint_wal()
-                    self._last_wal_checkpoint = now
-            except Exception as e:
-                _LOGGER.error("Failed to record port data: %s", e)
+        now = time.time()
+        last = self._last_port_ts.get(port, 0)
+        if now - last < self._point_interval:
+            return
+        self._last_port_ts[port] = now
+        row = (
+            now, port,
+            data.get("voltage"), data.get("current"), data.get("power"),
+            1 if data.get("active") else 0, data.get("protocol"),
+        )
+        with self._flush_lock:
+            self._pending_port.append(row)
 
     def query_history(
         self,
@@ -165,15 +224,10 @@ class PortHistory:
         hours: int = 24,
         interval: Optional[int] = None
     ) -> list[dict]:
-        """Query port history with optional downsampling.
-
-        Args:
-            port: Port number (1-4)
-            hours: Number of hours to query
-            interval: Aggregation interval in seconds (None = raw data)
-        """
+        """查询端口历史，可选降采样聚合。"""
         if not self._conn:
             return []
+        self._flush_before_read()
 
         cutoff = time.time() - (hours * 3600)
 
@@ -204,9 +258,10 @@ class PortHistory:
         return [dict(row) for row in rows]
 
     def get_statistics(self, port: int, hours: int = 24) -> dict:
-        """Get statistical summary for a port."""
+        """获取端口统计摘要。"""
         if not self._conn:
             return {}
+        self._flush_before_read()
 
         cutoff = time.time() - (hours * 3600)
         row = self._conn.execute(
@@ -264,9 +319,10 @@ class PortHistory:
         }
 
     def export_csv(self, port: int, hours: int = 24) -> str:
-        """Export port history as CSV string."""
+        """导出端口历史为 CSV 字符串。"""
         if not self._conn:
             return ""
+        self._flush_before_read()
 
         cutoff = time.time() - (hours * 3600)
         rows = self._conn.execute(
@@ -295,9 +351,10 @@ class PortHistory:
         return output.getvalue()
 
     def query_history_multi(self, start_port: int, end_port: int, hours: float, interval: int) -> list[dict]:
-        """Query history for multiple ports in a single query."""
+        """单次查询多端口历史（用于功率图表）。"""
         if not self._conn:
             return []
+        self._flush_before_read()
 
         cutoff = time.time() - (hours * 3600)
         rows = self._conn.execute(
@@ -340,16 +397,19 @@ class PortHistory:
         """Record a single data point for a charge session."""
         if not self._conn or not session_id:
             return
-        with self._db_lock:
-            try:
-                self._conn.execute(
-                    """INSERT INTO charge_points (session_id, timestamp, voltage, current, power, protocol)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (session_id, time.time(), voltage, current, power, protocol),
-                )
-                self._conn.commit()
-            except Exception as e:
-                _LOGGER.error("Failed to record charge point: %s", e)
+        # 降采样：同一会话距上次写入不足 _point_interval 秒则跳过
+        last = self._last_point_ts.get(session_id, 0)
+        now = time.time()
+        if now - last < self._point_interval:
+            return
+        self._last_point_ts[session_id] = now
+        row = (session_id, now, voltage, current, power, protocol)
+        with self._flush_lock:
+            self._pending_points.append(row)
+
+    def clear_point_throttle(self, session_id: int):
+        """清除某会话的降采样节流记录，供会话开始/结束时调用。"""
+        self._last_point_ts.pop(session_id, None)
 
     def end_session(self, session_id: int, total_wh: float, peak_power_w: float,
                     avg_voltage: float, avg_current: float, duration_sec: int):
@@ -359,15 +419,24 @@ class PortHistory:
         avg_power = total_wh / (duration_sec / 3600.0) if duration_sec > 0 else 0
         with self._db_lock:
             try:
+                # 标签按采样点协议众数回写（仅结束时算一次，后续纯读取）
+                # COALESCE：没有任何带协议的点时保留开始时写入的值
+                top_proto = self._conn.execute(
+                    """SELECT protocol FROM charge_points
+                       WHERE session_id = ? AND protocol != ''
+                       GROUP BY protocol ORDER BY COUNT(*) DESC LIMIT 1""",
+                    (session_id,),
+                ).fetchone()
                 self._conn.execute(
                     """UPDATE charge_sessions SET
                        end_time = ?, total_wh = ?, avg_power_w = ?,
                        peak_power_w = ?, avg_voltage = ?, avg_current = ?,
-                       duration_sec = ?
+                       duration_sec = ?, protocol = COALESCE(?, protocol)
                        WHERE id = ?""",
                     (time.time(), round(total_wh, 4), round(avg_power, 2),
                      round(peak_power_w, 2), round(avg_voltage, 2),
-                     round(avg_current, 2), duration_sec, session_id),
+                     round(avg_current, 2), duration_sec,
+                     top_proto[0] if top_proto else None, session_id),
                 )
                 self._conn.commit()
             except Exception as e:
@@ -385,54 +454,95 @@ class PortHistory:
             except Exception as e:
                 _LOGGER.error("Failed to delete session: %s", e)
 
-    def get_sessions(self, port: Optional[int] = None, period: str = "today",
-                     limit: int = 10, offset: int = 0) -> tuple:
-        """Query charge sessions."""
+    def get_sessions(self, port: int, limit: int = 5) -> tuple:
+        """查询某端口最近 limit 条会话，按开始时间倒序返回。
+
+        Args:
+            port: 端口号（1/2/3）
+            limit: 最多返回条数
+        """
         if not self._conn:
             return [], 0
-
-        now = time.time()
-        if period == "today":
-            from datetime import datetime
-            cutoff = datetime.now().replace(hour=0, minute=0, second=0).timestamp()
-        elif period == "yesterday":
-            from datetime import datetime
-            today_start = datetime.now().replace(hour=0, minute=0, second=0).timestamp()
-            cutoff = today_start - 86400
-            limit_end = today_start
-        elif period == "week":
-            cutoff = now - 7 * 86400
-        elif period == "month":
-            cutoff = now - 30 * 86400
-        else:
-            cutoff = 0
-
-        query = """SELECT id, port, start_time, end_time, total_wh, avg_power_w,
-                   peak_power_w, avg_voltage, avg_current, duration_sec, protocol,
-                   COUNT(*) OVER() AS total
-                   FROM charge_sessions WHERE start_time >= ? AND total_wh > 0"""
-        params = [cutoff]
-
-        if port is not None:
-            query += " AND port = ?"
-            params.append(port)
-
-        if period == "yesterday":
-            query += " AND start_time < ?"
-            params.append(limit_end)
-
-        query += " ORDER BY end_time IS NULL DESC, start_time DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-
-        rows = self._conn.execute(query, params).fetchall()
-        total = rows[0]["total"] if rows else 0
-
+        self._flush_before_read()
+        rows = self._conn.execute(
+            """SELECT id, port, start_time, end_time, total_wh, avg_power_w,
+                      peak_power_w, avg_voltage, avg_current, duration_sec, protocol
+               FROM charge_sessions
+               WHERE port = ? AND total_wh > 0
+               ORDER BY start_time DESC
+               LIMIT ?""",
+            (port, limit),
+        ).fetchall()
+        total = len(rows)
         return [dict(row) for row in rows], total
+
+    def prune_sessions(self, port: int, keep: int = 5):
+        """删除某端口超出 keep 条的旧会话及其明细点，保留最近 keep 条。"""
+        if not self._conn:
+            return
+        self._flush_before_read()
+        with self._db_lock:
+            try:
+                # 按 start_time 倒序，跳过最近 keep 条，取需删除的旧会话 id
+                rows = self._conn.execute(
+                    """SELECT id FROM charge_sessions
+                       WHERE port = ?
+                       ORDER BY start_time DESC
+                       LIMIT -1 OFFSET ?""",
+                    (port, keep)
+                ).fetchall()
+                if not rows:
+                    return
+                ids = [r["id"] for r in rows]
+                placeholders = ",".join("?" * len(ids))
+                self._conn.execute(f"DELETE FROM charge_points WHERE session_id IN ({placeholders})", ids)
+                self._conn.execute(f"DELETE FROM charge_sessions WHERE id IN ({placeholders})", ids)
+                self._conn.commit()
+            except Exception as e:
+                _LOGGER.error("Failed to prune sessions: %s", e)
+
+    def clear_sessions(self) -> int:
+        """清空已结束的充电会话及其明细点，返回被删除的会话条数。
+
+        进行中的会话（end_time 为空）保留：内存态仍持有其 session_id，
+        删掉后结束时 UPDATE 落空，本次充电的最终统计会整体丢失。
+        """
+        if not self._conn:
+            return 0
+        self._flush_before_read()
+        with self._db_lock:
+            try:
+                active_ids = [r["id"] for r in self._conn.execute(
+                    "SELECT id FROM charge_sessions WHERE end_time IS NULL"
+                ).fetchall()]
+                if active_ids:
+                    placeholders = ",".join("?" * len(active_ids))
+                    count = self._conn.execute(
+                        f"SELECT COUNT(*) FROM charge_sessions WHERE id NOT IN ({placeholders})",
+                        active_ids).fetchone()[0]
+                    self._conn.execute(
+                        f"DELETE FROM charge_points WHERE session_id NOT IN ({placeholders})",
+                        active_ids)
+                    self._conn.execute(
+                        f"DELETE FROM charge_sessions WHERE id NOT IN ({placeholders})",
+                        active_ids)
+                else:
+                    # 删除前统计会话条数，作为返回值
+                    count = self._conn.execute(
+                        "SELECT COUNT(*) FROM charge_sessions").fetchone()[0]
+                    self._conn.execute("DELETE FROM charge_points")
+                    self._conn.execute("DELETE FROM charge_sessions")
+                self._conn.commit()
+                return count
+            except Exception as e:
+                _LOGGER.error("Failed to clear sessions: %s", e)
+                return 0
 
     def get_session_points(self, session_id: int) -> list[dict]:
         """Get all data points for a charge session."""
         if not self._conn:
             return []
+        self._flush_before_read()
         rows = self._conn.execute(
             """SELECT timestamp, voltage, current, power, protocol
                FROM charge_points WHERE session_id = ?
@@ -440,65 +550,3 @@ class PortHistory:
             (session_id,),
         ).fetchall()
         return [dict(row) for row in rows]
-
-    def get_energy_stats(self, period: str = "today") -> dict:
-        """Get aggregated energy statistics."""
-        if not self._conn:
-            return {"period": period, "total_wh": 0, "session_count": 0}
-
-        now = time.time()
-        if period == "today":
-            from datetime import datetime
-            cutoff = datetime.now().replace(hour=0, minute=0, second=0).timestamp()
-        elif period == "yesterday":
-            from datetime import datetime
-            today_start = datetime.now().replace(hour=0, minute=0, second=0).timestamp()
-            cutoff = today_start - 86400
-            limit_end = today_start
-        elif period == "week":
-            cutoff = now - 7 * 86400
-        elif period == "month":
-            cutoff = now - 30 * 86400
-        else:
-            cutoff = 0
-
-        params1 = [cutoff]
-        params2 = [cutoff]
-        extra = ""
-        if period == "yesterday":
-            extra = " AND start_time < ?"
-            params1.append(limit_end)
-            params2.append(limit_end)
-
-        row = self._conn.execute(
-            f"""SELECT
-                COUNT(*) as session_count,
-                COALESCE(SUM(total_wh), 0) as total_wh,
-                COALESCE(MAX(peak_power_w), 0) as peak_power_w,
-                COALESCE(SUM(duration_sec), 0) as total_duration_sec
-            FROM charge_sessions WHERE start_time >= ?{extra} AND total_wh > 0""",
-            params1,
-        ).fetchone()
-
-        by_port = self._conn.execute(
-            f"""SELECT port, COALESCE(SUM(total_wh), 0) as wh, COUNT(*) as count
-               FROM charge_sessions WHERE start_time >= ?{extra} AND total_wh > 0
-               GROUP BY port""",
-            params2,
-        ).fetchall()
-
-        # Calculate avg power from total energy and duration (more accurate than DB avg)
-        total_dur = row["total_duration_sec"] or 0
-        total_wh = row["total_wh"] or 0
-        avg_power = round(total_wh / (total_dur / 3600), 1) if total_dur > 0 else 0
-
-        return {
-            "period": period,
-            "total_wh": round(total_wh, 2),
-            "session_count": row["session_count"],
-            "avg_power_w": avg_power,
-            "peak_power_w": round(row["peak_power_w"], 1),
-            "total_duration_sec": total_dur,
-            "by_port": {str(r["port"]): {"wh": round(r["wh"], 2), "count": r["count"]}
-                        for r in by_port},
-        }

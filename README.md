@@ -7,6 +7,18 @@
 [![Open in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=kairui1108&repository=cuktech-ble-ha-integration&category=integration)
 [![Add integration](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=cuktech_charger)
 
+## 本仓库说明
+
+本仓库是在 [kairui1108/cuktech-ble-ha](https://github.com/kairui1108/cuktech-ble-ha) 的1.0.9版本基础上做了一些修改，主要分三类：
+
+- **原版 bug 修复**：断连后永不重连、服务发现未完成导致认证失败循环、息屏时间映射错误、GET 等待期间推送帧被吞
+- **原版机制调整**：断开时只断充电器不再重置蓝牙适配器、连接探活与重试、启动后补读端口状态、插线后协议快照失效窗口，蓝牙策略降级到原版1.0.3的逻辑，我实测没有老版稳定。
+- **新增功能**：按照我喜欢的逻辑大幅修改了充电记录相关的功能（会话/历史/详情/协议标签/拔线容错/凌晨自动结转）、Web 页管理调整（迷你图、显示精度、缓存策略、开关防跳动）等
+
+每条改动的编号、说明和涉及文件都在 [MAINTENANCE.md](MAINTENANCE.md) 中逐步记录，以下为原版 README 内容。
+
+---
+
 通过 BLE（低功耗蓝牙）将 CUKTECH 10 GaN Charger Ultra 充电器接入 Home Assistant，实现实时功率监控、端口控制和自动化。
 
 支持两种网关方案：**Python BLE Server**（运行在 Linux/Docker）或 **ESP32 BLE Bridge**（独立硬件）。

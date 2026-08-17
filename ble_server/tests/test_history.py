@@ -68,14 +68,14 @@ class TestPortHistory:
     def test_cleanup_old_data(self, history):
         """Test that old data is cleaned up."""
         # Insert old data
-        history._conn.execute(
-            "INSERT INTO port_history (timestamp, port, voltage, current, power, active, protocol) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (time.time() - 200000, 1, 10.0, 1.0, 10.0, 1, "PD")
-        )
-        history._conn.commit()
-
-        # Cleanup
-        history._cleanup_old_data()
+        with history._db_lock:
+            history._conn.execute(
+                "INSERT INTO port_history (timestamp, port, voltage, current, power, active, protocol) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time() - 200000, 1, 10.0, 1.0, 10.0, 1, "PD")
+            )
+            history._conn.commit()
+            # Cleanup
+            history._cleanup_old_data()
 
         # Verify old data is removed
         rows = history.query_history(1, hours=100)

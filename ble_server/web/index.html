@@ -8,7 +8,7 @@
     <link rel="preload" href="/static/chart.umd.min.js" as="script">
     <link rel="preload" href="/static/charger.png" as="image">
     <script defer src="/static/chart.umd.min.js"></script>
-    <script defer src="/static/charge_history.js?v=2"></script>
+    <script defer src="/static/charge_history.js"></script>
     <script src="/static/chart-loader.js"></script>
     <script src="/static/chart-config.js"></script>
     <link rel="stylesheet" href="static/index.css">
@@ -116,42 +116,39 @@
         <!-- Charge History Card -->
         <div class="card">
             <div class="card-title">充电记录
-                <select id="chargePeriod" onchange="startChargeHistoryAutoRefresh('chargeSessionList','chargeStats',this.value,30000)" style="margin-left:auto;background:var(--card-bg);border:1px solid var(--card-border);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--text-dim);">
-                    <option value="today">今日</option>
-                    <option value="yesterday">昨日</option>
-                    <option value="week">本周</option>
-                    <option value="month">本月</option>
-                    <option value="all">全部</option>
-                </select>
+                <button id="btnChargeHistory" style="margin-left:auto;background:var(--card-bg);border:1px solid var(--card-border);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--text-dim);cursor:pointer;">历史记录</button>
             </div>
-            <div id="chargeStats" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;text-align:center;justify-items:center;"></div>
-            <div id="chargeSessionList"></div>
-            <!-- Session Detail -->
-            <div id="sessionDetail" style="display:none;margin-top:16px;padding-top:16px;border-top:1px solid var(--card-border);">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                    <span id="sdTitle" style="font-size:15px;font-weight:600;color:var(--text);"></span>
-                    <span id="sdDuration" style="font-size:13px;color:var(--text-dim);"></span>
+            <div id="currentC1" class="current-charge-card"></div>
+            <div id="currentC2" class="current-charge-card"></div>
+            <div id="chargeHistoryView" style="display:none;">
+                <!-- 历史列表（详情打开时整体隐藏） -->
+                <div id="historyListWrap">
+                    <div class="charge-view-head">
+                        <span class="charge-view-title">历史记录</span>
+                        <button onclick="clearAllSessions()" class="btn-clear">清理</button>
+                    </div>
+                    <div id="historyListC1" class="history-group"></div>
+                    <div id="historyListC2" class="history-group"></div>
                 </div>
-                <div style="display:flex;align-items:center;justify-content:flex-end;gap:6px;margin-bottom:8px;">
-                    <span style="font-size:11px;color:var(--text-dim);">精度</span>
-                    <select onchange="setDownsample(this.value)" style="background:var(--card-bg);border:1px solid var(--card-border);border-radius:6px;padding:2px 8px;font-size:11px;color:var(--text-dim);">
-                        <option value="0">全部</option>
-                        <option value="100">100点</option>
-                        <option value="200">200点</option>
-                        <option value="300" selected>300点</option>
-                        <option value="600">600点</option>
-                    </select>
-                </div>
-                <div style="height:160px;"><canvas id="sessionChart"></canvas></div>
-                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;">
-                    <div style="text-align:center;"><div style="font-size:18px;font-weight:700;color:var(--text);" id="sdEnergy">0</div><div style="font-size:11px;color:var(--text-dim);">电量 Wh</div></div>
-                    <div style="text-align:center;"><div style="font-size:18px;font-weight:700;color:var(--text);" id="sdAvgP">0</div><div style="font-size:11px;color:var(--text-dim);">均功率 W</div></div>
-                    <div style="text-align:center;"><div style="font-size:18px;font-weight:700;color:var(--text);" id="sdPeakP">0</div><div style="font-size:11px;color:var(--text-dim);">峰功率 W</div></div>
-                </div>
-                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px;">
-                    <div style="text-align:center;"><div style="font-size:18px;font-weight:700;color:var(--text);" id="sdAvgV">0</div><div style="font-size:11px;color:var(--text-dim);">均电压 V</div></div>
-                    <div style="text-align:center;"><div style="font-size:18px;font-weight:700;color:var(--text);" id="sdAvgI">0</div><div style="font-size:11px;color:var(--text-dim);">均电流 A</div></div>
-                    <div style="text-align:center;padding-top:6px;"><button onclick="closeSessionDetail()" style="background:rgba(255,59,48,0.1);border:1px solid rgba(255,59,48,0.3);color:#FF3B30;border-radius:8px;padding:8px 20px;font-size:12px;cursor:pointer;">关闭</button></div>
+                <!-- 单次详情：原地替换历史列表 -->
+                <div id="sessionDetail" style="display:none;">
+                    <div class="sd-head">
+                        <div class="sd-head-left">
+                            <span id="sdTitle" class="sd-title"></span>
+                            <span id="sdDuration" class="sd-duration"></span>
+                        </div>
+                        <button onclick="backToHistoryList()" class="btn-back">返回</button>
+                    </div>
+                    <div class="sd-stats">
+                        <div class="sd-cell"><div class="sd-cell-value"><span id="sdEnergy">0</span><span class="sd-cell-unit"> Wh</span></div><div class="sd-cell-mah" id="sdEnergyMah"></div><div class="sd-cell-label">电量</div></div>
+                        <div class="sd-cell"><div class="sd-cell-value"><span id="sdAvgP">0</span><span class="sd-cell-unit"> W</span></div><div class="sd-cell-label">平均功率</div></div>
+                        <div class="sd-cell"><div class="sd-cell-value"><span id="sdPeakP">0</span><span class="sd-cell-unit"> W</span></div><div class="sd-cell-label">峰值功率</div></div>
+                    </div>
+                    <div class="sd-row2">
+                        <div class="sd-cell"><div class="sd-cell-value"><span id="sdAvgV">0</span><span class="sd-cell-unit"> V</span></div><div class="sd-cell-label">平均电压</div></div>
+                        <div class="sd-cell"><div class="sd-cell-value"><span id="sdAvgI">0</span><span class="sd-cell-unit"> A</span></div><div class="sd-cell-label">平均电流</div></div>
+                    </div>
+                    <div class="sd-chart"><canvas id="sessionChart"></canvas></div>
                 </div>
             </div>
         </div>
@@ -204,6 +201,8 @@
                     <div class="theme-option" onclick="setLogLevel('error')" data-level="error">Error</div>
                 </div>
             </div>
+            <span style="margin: 0 12px; color: var(--text-dim);">|</span>
+            <button class="theme-btn" onclick="openBleLogModal()">🔗 蓝牙日志</button>
         </div>
     </div>
 
@@ -227,6 +226,16 @@
         </div>
     </div>
 
-    <script defer src="/static/app.js"></script>
+    <div class="modal-overlay" id="bleLogModal">
+        <div class="modal" style="max-width:600px;">
+            <div class="modal-header">
+                <span class="modal-title">蓝牙连接日志</span>
+                <button class="modal-close" onclick="closeBleLogModal()">&times;</button>
+            </div>
+            <div id="bleLogList" style="max-height:400px;overflow-y:auto;font-size:12px;font-family:monospace;"></div>
+        </div>
+    </div>
+
+    <script defer src="/static/app.js?v=9"></script>
 </body>
 </html>

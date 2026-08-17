@@ -49,7 +49,8 @@ const SCENE_DESCS = {
     4: '多个端口均衡分配充电功率',
 };
 const SCENE_PIID = 5;
-const SCREEN_TIMES = ['5分钟', '1分钟', '10分钟', '30分钟', '常亮'];
+const SCREEN_TIMES = ['1分钟', '5分钟', '10分钟', '30分钟', '常亮'];
+const SCREEN_VALUES = [5, 1, 2, 3, 4];
 const PORT_KEYS = ['c1', 'c2', 'c3', 'a'];
 const PORT_NAMES = { c1: 'C1', c2: 'C2', c3: 'C3', a: 'USB-A' };
 const PORT_COLORS = { c1: '#FF7A00', c2: '#46B4FF', c3: '#89D8F3', a: '#FFD24B' };
@@ -59,11 +60,13 @@ const API_PORT_MAP = { 1: 'c1', 2: 'c2', 3: 'c3', 4: 'a' };
 let lastLocalChange = 0;
 function markLocalChange() { lastLocalChange = Date.now(); }
 function isRecentLocal() { return Date.now() - lastLocalChange < 3000; }
+// 端口开关 pending：请求期间该口 enabled 不被服务器状态覆盖，防止慢响应时开关跳回旧值
+const pendingPortToggles = {};
 let state = {
     scene: 1,
     screenTime: 0,
     bleConnected: false,
-    ports: { c1:{v:0,a:0,w:0,protocol:'idle',enabled:true}, c2:{v:0,a:0,w:0,protocol:'idle',enabled:true}, c3:{v:0,a:0,w:0,protocol:'idle',enabled:true}, a:{v:0,a:0,w:0,protocol:'idle',enabled:true} },
+    ports: { c1:{v:0,a:0,w:0,active:false,protocol:'idle',enabled:true}, c2:{v:0,a:0,w:0,active:false,protocol:'idle',enabled:true}, c3:{v:0,a:0,w:0,active:false,protocol:'idle',enabled:true}, a:{v:0,a:0,w:0,active:false,protocol:'idle',enabled:true} },
     settings: {},
     firmware: '',
     trickleEnabled: false,
@@ -109,6 +112,7 @@ async function fetchStatus() {
                     state.ports[key].v = port.voltage || 0;
                     state.ports[key].a = port.current || 0;
                     state.ports[key].w = port.power || 0;
+                    state.ports[key].active = port.active === true;
                     if (!isRecentLocal()) state.ports[key].enabled = port.enabled !== false;
                     state.ports[key].protocol = port.protocol || 'idle';
                     state.ports[key].status_raw = port.status_raw;
@@ -122,7 +126,7 @@ async function fetchStatus() {
             const sceneVal = data.settings['5'];
             if (sceneVal && sceneVal > 0 && !isRecentLocal()) state.scene = sceneVal;
             if (!isRecentLocal()) {
-                if (data.settings['6'] !== undefined) state.screenTime = data.settings['6'];
+                if (data.settings['6'] !== undefined) { const idx = SCREEN_VALUES.indexOf(data.settings['6']); if (idx >= 0) state.screenTime = idx; }
                 if (data.settings['15'] !== undefined) state.trickleEnabled = data.settings['15'] === 1;
             }
             if (!isRecentLocal()) {
@@ -212,7 +216,8 @@ function renderAll() {
 function renderDeviceArea() {
     let totalW = 0, hasAny = false;
     for (const [key, p] of Object.entries(state.ports)) {
-        if (p.enabled && p.w > 0) { totalW += p.w; hasAny = true; }
+        if (p.enabled && p.w > 0) totalW += p.w;
+        if (p.enabled && p.active) hasAny = true;
     }
 
     const unconnectedImg = document.getElementById('unconnectedImg');
@@ -237,15 +242,15 @@ function renderDeviceArea() {
         badge.classList.remove('show');
     }
 
-    // USB overlay modules
+    // USB overlay modules：插线即显示（0W 也显示），功率只改数字
     const modulePositions = { c1: 36, c2: 68, c3: 100, a: 133 };
     for (const [key, p] of Object.entries(state.ports)) {
         const mod = document.getElementById('usbModule' + key.toUpperCase());
         const powerEl = document.getElementById('usbPower' + key.toUpperCase());
-        if (p.enabled && p.w > 0) {
+        if (mod && p.enabled && p.active) {
             mod.classList.add('active');
             mod.style.top = modulePositions[key] + 'px';
-            powerEl.textContent = p.w.toFixed(1) + 'W';
+            if (powerEl) powerEl.textContent = p.w.toFixed(1) + 'W';
         } else {
             mod.classList.remove('active');
         }
@@ -546,10 +551,12 @@ async function togglePort(key) {
     const on = !state.ports[key].enabled;
     state.ports[key].enabled = on;
     markLocalChange();
+    pendingPortToggles[key] = true;
     renderAll();
     try {
         await fetch(`${API_BASE}/api/port`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port: key, action: on ? 'on' : 'off' }) });
     } catch(e) { console.error(e); }
+    finally { delete pendingPortToggles[key]; }
 }
 
 async function toggleTrickle() {
@@ -563,7 +570,7 @@ async function cycleScreenTime() {
     document.getElementById('screenTimeVal').innerHTML =
         SCREEN_TIMES[state.screenTime] + ' <img src="static/plugin_imgs/main_charger_dark_icon_more.png" alt="">';
     markLocalChange();
-    try { await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: 6, value: state.screenTime }) }); } catch(e) {}
+    try { await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: 6, value: SCREEN_VALUES[state.screenTime] }) }); } catch(e) {}
 }
 
 // ── Top-view fade on scroll ──
@@ -634,6 +641,7 @@ setInterval(async () => {
                         state.ports[key].v = port.voltage || 0;
                         state.ports[key].a = port.current || 0;
                         state.ports[key].w = port.power || 0;
+                        state.ports[key].active = port.active === true;
                         state.ports[key].enabled = port.enabled !== false;
                         state.ports[key].protocol = port.protocol || 'idle';
                     }
@@ -671,6 +679,7 @@ function initPhoneSSE() {
                             state.ports[key].v = 0;
                             state.ports[key].a = 0;
                             state.ports[key].w = 0;
+                            state.ports[key].active = false;
                             state.ports[key].protocol = 'idle';
                         }
                         renderDeviceArea();
@@ -684,6 +693,7 @@ function initPhoneSSE() {
                                 state.ports[key].v = port.voltage || 0;
                                 state.ports[key].a = port.current || 0;
                                 state.ports[key].w = port.power || 0;
+                                state.ports[key].active = port.active === true;
                                 state.ports[key].enabled = port.enabled !== false;
                                 state.ports[key].protocol = port.protocol || 'idle';
                             }
@@ -723,16 +733,17 @@ function applyFullStatus(data) {
     state.firmware = data.firmware_version || '';
     if (data.ports) {
         for (const [id, port] of Object.entries(data.ports)) {
-            const key = API_PORT_MAP[id];
-            if (key && state.ports[key]) {
-                state.ports[key].v = port.voltage || 0;
-                state.ports[key].a = port.current || 0;
-                state.ports[key].w = port.power || 0;
-                if (!isRecentLocal()) state.ports[key].enabled = port.enabled !== false;
-                state.ports[key].protocol = port.protocol || 'idle';
-                state.ports[key].status_raw = port.status_raw;
+                const key = API_PORT_MAP[id];
+                if (key && state.ports[key]) {
+                    state.ports[key].v = port.voltage || 0;
+                    state.ports[key].a = port.current || 0;
+                    state.ports[key].w = port.power || 0;
+                    state.ports[key].active = port.active === true;
+                    if (!pendingPortToggles[key]) state.ports[key].enabled = port.enabled !== false;
+                    state.ports[key].protocol = port.protocol || 'idle';
+                    state.ports[key].status_raw = port.status_raw;
+                }
             }
-        }
     }
     if (data.protocol_switches) state.protocolSwitches = data.protocol_switches;
     if (data.protocol_extend !== undefined) state.protocolExtend = data.protocol_extend;
@@ -747,7 +758,8 @@ function applyPortUpdate(portId, portData) {
     state.ports[key].v = portData.voltage || 0;
     state.ports[key].a = portData.current || 0;
     state.ports[key].w = portData.power || 0;
-    if (!isRecentLocal()) state.ports[key].enabled = portData.enabled !== false;
+    state.ports[key].active = portData.active === true;
+    if (!pendingPortToggles[key]) state.ports[key].enabled = portData.enabled !== false;
     state.ports[key].protocol = portData.protocol || 'idle';
     state.ports[key].status_raw = portData.status_raw;
     // 500ms 去抖刷新组合图表（数据到达时及时更新，稳定期由 2s 定时器补充）
@@ -768,7 +780,7 @@ function applySettingsUpdate(settings) {
     const sceneVal = settings['5'];
     if (sceneVal && sceneVal > 0 && !isRecentLocal()) state.scene = sceneVal;
     if (!isRecentLocal()) {
-        if (settings['6'] !== undefined) state.screenTime = settings['6'];
+        if (settings['6'] !== undefined) { const idx = SCREEN_VALUES.indexOf(settings['6']); if (idx >= 0) state.screenTime = idx; }
         if (settings['15'] !== undefined) state.trickleEnabled = settings['15'] === 1;
     }
     if (!isRecentLocal()) {
@@ -780,7 +792,7 @@ function applySettingsUpdate(settings) {
     renderAll();
 }
 
-// ── Charge History ──
-if (typeof startChargeHistoryAutoRefresh === 'function') {
-    startChargeHistoryAutoRefresh('chargeSessionList', 'chargeStats', 'today', 2000);
+// ── 充电记录板块初始化 ──
+if (typeof initChargeHistory === 'function') {
+    initChargeHistory();
 }

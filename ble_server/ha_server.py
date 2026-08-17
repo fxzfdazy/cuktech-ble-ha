@@ -18,7 +18,7 @@ from collections import OrderedDict
 from pathlib import Path
 from aiohttp import web
 
-from config import load_config, LOG_LEVELS
+from config import load_config, LOG_LEVELS, parse_power_thresholds
 from state import ChargerState, PORT_BITS, PORT_NAMES, PORT_DEFAULT, VALID_PIIDS, PIID_RANGES, PROTOCOL_SWITCH_BITS
 from ble_manager import BLEManager, set_status_cache_invalidator
 from history import PortHistory
@@ -279,6 +279,13 @@ class Server:
             "connected": connected,
             "uid": uid_display,
             "configured": bool(uid),
+        })
+
+    async def handle_ble_events(self, request):
+        """GET /api/ble-events — 返回 BLE 连接事件日志。"""
+        return web.json_response({
+            "ok": True,
+            "events": self.ble.get_ble_events(),
         })
 
     async def setup_mqtt(self):
@@ -772,6 +779,12 @@ class Server:
         path = '/phone.html' if self.MOBILE_UA.search(ua) else '/index.html'
         entry = _static_cache.get(path)
         if entry:
+            etag = entry.get("etag")
+            if etag and request.headers.get("If-None-Match") == etag:
+                return web.Response(status=304, headers={
+                    "ETag": etag,
+                    "Cache-Control": "no-cache",
+                })
             accept_gzip = request.headers.get("Accept-Encoding", "").find("gzip") != -1
             if accept_gzip and entry["gzipped"]:
                 body = entry["gzipped"]
@@ -779,142 +792,270 @@ class Server:
                     "Content-Type": "text/html",
                     "Content-Encoding": "gzip",
                     "Content-Length": str(len(body)),
-                    "Cache-Control": "public, max-age=604800, immutable",
+                    "Cache-Control": "no-cache",
                 }
             else:
                 body = entry["raw"]
                 headers = {
                     "Content-Type": "text/html",
                     "Content-Length": str(len(body)),
-                    "Cache-Control": "public, max-age=604800, immutable",
+                    "Cache-Control": "no-cache",
                 }
+            if etag:
+                headers["ETag"] = etag
             return web.Response(body=body, headers=headers)
         return web.FileResponse(WEB_DIR / path.lstrip('/'))
 
     # ── Charge Session API ──
 
     async def handle_sessions(self, request):
-        """GET /api/sessions?port=c1&period=today&limit=10&page=1"""
-        port_str = request.query.get("port", "")
-        period = request.query.get("period", "today")
-        limit = min(int(request.query.get("limit", "10")), 50)
-        page = max(1, int(request.query.get("page", "1")))
+        """GET /api/sessions?port=c1&limit=5
 
-        port = None
-        if port_str:
-            port_map = {"c1": 1, "c2": 2, "c3": 3, "a": 4}
-            port = port_map.get(port_str)
+        按端口查询最近若干次充电会话，port 必填。
+        """
+        port_str = request.query.get("port", "")
+        port_map = {"c1": 1, "c2": 2, "c3": 3, "a": 4}
+        port = port_map.get(port_str)
+        if port is None:
+            return web.json_response(
+                {"ok": False, "error": "缺少或非法的 port 参数，可选值 c1/c2/c3/a"},
+                status=400,
+            )
+
+        try:
+            limit = int(request.query.get("limit", "5"))
+        except (ValueError, TypeError):
+            limit = 5
+        if limit < 1:
+            limit = 5
+        limit = min(limit, 50)
 
         loop = asyncio.get_running_loop()
         sessions, total = await loop.run_in_executor(
-            None, self.history.get_sessions, port, period, limit, (page - 1) * limit)
+            None, self.history.get_sessions, port, limit)
 
-        # Merge live energy data for active sessions
+        # 合并该端口的活跃会话实时数据
         now = time.time()
         live = self.ble.get_live_session_data()
-        db_session_ids = {s.get("id") for s in sessions}
-        for port_id, ld in live.items():
-            sid = ld.get("session_id")
+        ld = live.get(port)
+        live_sid = None
+        if ld:
+            live_sid = ld.get("session_id")
+            start_time = ld.get("start_time") or now
+            dur_sec = max(1, int(now - start_time))
+            dur_h = dur_sec / 3600.0
+            avg_p = round(ld["session_wh"] / dur_h, 1) if dur_h > 0 else 0
+            port_state = self.ble.state.ports.get(port)
+            avg_v = round(port_state.voltage, 2) if port_state else 0
+            avg_i = round(port_state.current, 2) if port_state else 0
             matched = False
             for s in sessions:
-                if s.get("id") == sid:
+                if s.get("id") == live_sid:
+                    # 用实时数据覆盖数据库里的旧值
                     s["total_wh"] = ld["session_wh"]
                     s["peak_power_w"] = max(s.get("peak_power_w", 0), ld["max_power"])
-                    # Recalculate avg from live data (DB values are stale for active sessions)
-                    start_time = ld.get("start_time") or now
-                    dur_sec = max(1, int(now - start_time))
-                    dur_h = dur_sec / 3600.0
-                    s["avg_power_w"] = round(ld["session_wh"] / dur_h, 1) if dur_h > 0 else 0
-                    port_state = self.ble.state.ports.get(port_id)
-                    if port_state:
-                        s["avg_voltage"] = round(port_state.voltage, 2)
-                        s["avg_current"] = round(port_state.current, 2)
+                    s["avg_power_w"] = avg_p
+                    s["voltage"] = avg_v
+                    s["current"] = avg_i
                     s["duration_sec"] = dur_sec
                     s["is_active"] = True
                     matched = True
                     break
-            if not matched and sid:
-                # Active session not in DB results (total_wh=0, filtered out) — add it
-                start_time = ld.get("start_time") or now
-                dur_sec = max(1, int(now - start_time))
-                dur_h = dur_sec / 3600.0
-                avg_p = round(ld["session_wh"] / dur_h, 1) if dur_h > 0 else 0
-                # Current V/I from port state as approximate averages for active session
-                port_state = self.ble.state.ports.get(port_id)
-                avg_v = round(port_state.voltage, 2) if port_state else 0
-                avg_i = round(port_state.current, 2) if port_state else 0
+            if not matched and live_sid:
+                # 活跃会话未落入结果（total_wh=0 被过滤），补到列表头部
                 sessions.insert(0, {
-                    "id": sid, "port": port_id, "start_time": start_time,
+                    "id": live_sid, "port": port, "start_time": start_time,
                     "end_time": None, "total_wh": ld["session_wh"],
                     "avg_power_w": avg_p, "peak_power_w": ld["max_power"],
-                    "avg_voltage": avg_v, "avg_current": avg_i,
+                    "voltage": avg_v, "current": avg_i,
                     "duration_sec": dur_sec,
-                    "protocol": port_state.protocol if port_state else "", "is_active": True,
+                    "protocol": port_state.protocol if port_state else "",
+                    "is_active": True,
                 })
                 total += 1
 
-        # Mark unmatched sessions as inactive
-        live_sids = {ld.get("session_id") for ld in live.values()}
+        # 非活跃会话标记为未充电中
         for s in sessions:
-            if s.get("id") not in live_sids:
+            if s.get("id") != live_sid:
                 s["is_active"] = False
 
         return web.json_response({
             "sessions": sessions,
             "total": total,
-            "page": page,
-            "limit": limit,
-            "pages": max(1, (total + limit - 1) // limit),
         })
 
     async def handle_session_points(self, request):
-        """GET /api/sessions/{id}/points?downsample=600"""
+        """GET /api/sessions/{id}/points
+
+        明细点已在写入时按采样间隔降采样；返回前再按窗口与点数上限裁剪，
+        防止长时充电（如连插数天）的会话把接口响应与前端图表拖垮。
+        """
         sid = int(request.match_info["id"])
-        target = int(request.query.get("downsample", "0"))
         loop = asyncio.get_running_loop()
         points = await loop.run_in_executor(
             None, self.history.get_session_points, sid)
-        if target > 0 and len(points) > target:
-            from downsample import lttb_downsample
-            points = await loop.run_in_executor(
-                None, lttb_downsample, points, target)
-        return web.json_response({"points": points})
+        return web.json_response({"points": trim_session_points(points)})
 
-    async def handle_energy_stats(self, request):
-        """GET /api/energy/stats?period=today"""
-        period = request.query.get("period", "today")
+    async def handle_sessions_clear(self, request):
+        """POST /api/sessions/clear — 清空全部充电会话及其明细点。"""
         loop = asyncio.get_running_loop()
-        stats = await loop.run_in_executor(
-            None, self.history.get_energy_stats, period)
+        deleted = await loop.run_in_executor(
+            None, self.history.clear_sessions)
+        return web.json_response({"ok": True, "deleted": deleted})
 
-        # Merge live data from active sessions
-        now = time.time()
-        live = self.ble.get_live_session_data()
-        live_count = len(live)
-        for port, ld in live.items():
-            stats["total_wh"] = round(stats["total_wh"] + ld["session_wh"], 2)
-            stats["peak_power_w"] = max(stats.get("peak_power_w", 0), ld["max_power"])
-            # Add live duration for active sessions
-            if ld.get("start_time"):
-                live_duration = int(now - ld["start_time"])
-                stats["total_duration_sec"] = stats.get("total_duration_sec", 0) + live_duration
-            port_key = str(port)
-            if port_key not in stats.get("by_port", {}):
-                stats.setdefault("by_port", {})[port_key] = {"wh": 0, "count": 0}
-            stats["by_port"][port_key]["wh"] = round(
-                stats["by_port"][port_key]["wh"] + ld["session_wh"], 2)
-            stats["by_port"][port_key]["count"] = stats["by_port"][port_key].get("count", 0) + 1
-            stats["by_port"][port_key]["is_active"] = True
+    async def handle_get_charge_tracking(self, request):
+        """GET /api/charge_tracking — 返回充电记录配置。"""
+        ct = self.ble.config.charge_tracking
+        return web.json_response({
+            "enabled_ports": list(ct.enabled_ports),
+            "start_power_w": {"c1": ct.start_power_w.get(1, 0.0), "c2": ct.start_power_w.get(2, 0.0)},
+            "end_power_w": {"c1": ct.end_power_w.get(1, 0.0), "c2": ct.end_power_w.get(2, 0.0)},
+            "end_power_duration_sec": ct.end_power_duration_sec,
+            "unplug_grace_sec": ct.unplug_grace_sec,
+            "point_interval_sec": ct.point_interval_sec,
+        })
 
-        # DB count excludes active sessions (total_wh=0), add them back
-        stats["session_count"] = stats.get("session_count", 0) + live_count
+    async def handle_set_charge_tracking(self, request):
+        """POST /api/charge_tracking — 更新充电记录配置并持久化到 config.yaml。"""
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
 
-        # Recalculate avg_power_w from total energy and total duration
-        total_dur = stats.get("total_duration_sec", 0)
-        total_wh = stats.get("total_wh", 0)
-        stats["avg_power_w"] = round(total_wh / (total_dur / 3600), 1) if total_dur > 0 else 0
+        # 校验 enabled_ports：仅允许 1/2
+        raw_ports = data.get("enabled_ports")
+        if raw_ports is None:
+            return web.json_response(
+                {"ok": False, "error": "缺少 enabled_ports"}, status=400)
+        if not isinstance(raw_ports, list):
+            raw_ports = [raw_ports]
+        enabled_ports = []
+        for p in raw_ports:
+            try:
+                port = int(p)
+            except (ValueError, TypeError):
+                return web.json_response(
+                    {"ok": False, "error": f"非法端口值: {p}"}, status=400)
+            if port not in (1, 2):
+                return web.json_response(
+                    {"ok": False, "error": f"仅支持 C1/C2，收到 {port}"}, status=400)
+            if port not in enabled_ports:
+                enabled_ports.append(port)
 
-        return web.json_response(stats)
+        # 校验功率阈值：按端口独立，标量表示两口同值；必须为数字且非负
+        try:
+            start_power_w = parse_power_thresholds(data.get("start_power_w", 0))
+        except ValueError as e:
+            return web.json_response(
+                {"ok": False, "error": f"start_power_w: {e}"}, status=400)
+        try:
+            end_power_w = parse_power_thresholds(data.get("end_power_w", 0))
+        except ValueError as e:
+            return web.json_response(
+                {"ok": False, "error": f"end_power_w: {e}"}, status=400)
+
+        # 校验采样间隔：最小 1 秒
+        try:
+            point_interval_sec = int(data.get("point_interval_sec", 60))
+        except (ValueError, TypeError):
+            return web.json_response(
+                {"ok": False, "error": "point_interval_sec 必须为整数"}, status=400)
+        if point_interval_sec < 1:
+            return web.json_response(
+                {"ok": False, "error": "point_interval_sec 不能小于 1"}, status=400)
+
+        # 校验截止判定持续时长：最小 1 秒，未传时保持当前值
+        try:
+            end_power_duration_sec = int(
+                data.get("end_power_duration_sec", self.ble.config.charge_tracking.end_power_duration_sec))
+        except (ValueError, TypeError):
+            return web.json_response(
+                {"ok": False, "error": "end_power_duration_sec 必须为整数"}, status=400)
+        if end_power_duration_sec < 1:
+            return web.json_response(
+                {"ok": False, "error": "end_power_duration_sec 不能小于 1"}, status=400)
+
+        # 校验拔线容错时长：0=关闭，未传时保持当前值
+        try:
+            unplug_grace_sec = int(
+                data.get("unplug_grace_sec", self.ble.config.charge_tracking.unplug_grace_sec))
+        except (ValueError, TypeError):
+            return web.json_response(
+                {"ok": False, "error": "unplug_grace_sec 必须为整数"}, status=400)
+        if unplug_grace_sec < 0:
+            return web.json_response(
+                {"ok": False, "error": "unplug_grace_sec 不能为负"}, status=400)
+
+        # 更新内存配置（已存在的活跃会话不打断，新插拔按新配置执行）
+        ct = self.ble.config.charge_tracking
+        ct.enabled_ports = enabled_ports
+        ct.start_power_w = start_power_w
+        ct.end_power_w = end_power_w
+        ct.end_power_duration_sec = end_power_duration_sec
+        ct.unplug_grace_sec = unplug_grace_sec
+        ct.point_interval_sec = point_interval_sec
+
+        # 实时更新 history 的采样间隔与检测器的持续时长
+        if self.ble._history:
+            self.ble._history.set_point_interval(point_interval_sec)
+        for pdet in self.ble._power_detectors.values():
+            pdet.duration_sec = end_power_duration_sec
+
+        # 持久化到 config.yaml
+        ok, err = self._persist_charge_tracking()
+        start_map = {"c1": ct.start_power_w.get(1, 0.0), "c2": ct.start_power_w.get(2, 0.0)}
+        end_map = {"c1": ct.end_power_w.get(1, 0.0), "c2": ct.end_power_w.get(2, 0.0)}
+        if not ok:
+            return web.json_response({
+                "ok": False,
+                "error": f"配置已生效但持久化失败: {err}",
+                "enabled_ports": list(ct.enabled_ports),
+                "start_power_w": start_map,
+                "end_power_w": end_map,
+                "end_power_duration_sec": ct.end_power_duration_sec,
+                "unplug_grace_sec": ct.unplug_grace_sec,
+                "point_interval_sec": ct.point_interval_sec,
+            }, status=500)
+
+        _LOGGER.info("充电记录配置已更新: enabled_ports=%s start_power_w=%s end_power_w=%s end_dur=%ss grace=%ss",
+                     enabled_ports, start_map, end_map, ct.end_power_duration_sec, ct.unplug_grace_sec)
+        return web.json_response({
+            "ok": True,
+            "enabled_ports": list(ct.enabled_ports),
+            "start_power_w": start_map,
+            "end_power_w": end_map,
+            "end_power_duration_sec": ct.end_power_duration_sec,
+            "unplug_grace_sec": ct.unplug_grace_sec,
+            "point_interval_sec": ct.point_interval_sec,
+        })
+
+    def _persist_charge_tracking(self):
+        """把充电记录配置写回 config.yaml，返回 (ok, error)。"""
+        try:
+            import yaml
+            config_path = self._config_path()
+            cfg = {}
+            if config_path.exists():
+                with open(config_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+            ct = self.ble.config.charge_tracking
+            cfg["charge_tracking"] = {
+                "enabled_ports": list(ct.enabled_ports),
+                "start_power_w": {"c1": ct.start_power_w.get(1, 0.0), "c2": ct.start_power_w.get(2, 0.0)},
+                "end_power_w": {"c1": ct.end_power_w.get(1, 0.0), "c2": ct.end_power_w.get(2, 0.0)},
+                "end_power_duration_sec": ct.end_power_duration_sec,
+                "unplug_grace_sec": ct.unplug_grace_sec,
+                "point_interval_sec": ct.point_interval_sec,
+            }
+            # 原子写入：先写临时文件再重命名
+            tmp_path = config_path.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
+                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+            os.replace(tmp_path, config_path)
+            return True, None
+        except Exception as e:
+            _LOGGER.warning("持久化充电记录配置失败", exc_info=True)
+            return False, str(e)
 
     async def handle_sse(self, request):
         """GET /api/events — Server-Sent Events stream."""
@@ -1251,9 +1392,53 @@ class Server:
 WEB_DIR = Path(__file__).parent / "web"
 _server = None
 
+# 会话明细点返回上限：时间窗最多一天（超过则只取最近一天滚动），
+# 窗口内点数再超上限时等间隔抽稀，保证接口响应与前端图表恒定轻量
+SESSION_POINTS_MAX_SPAN_SEC = 86400
+SESSION_POINTS_MAX_COUNT = 500
+
+
+def trim_session_points(points: list) -> list:
+    """按一天滚动窗口裁剪并抽稀会话明细点，保留首尾点。"""
+    if not points:
+        return points
+    last_ts = points[-1]["timestamp"]
+    if last_ts - points[0]["timestamp"] > SESSION_POINTS_MAX_SPAN_SEC:
+        cutoff = last_ts - SESSION_POINTS_MAX_SPAN_SEC
+        points = [p for p in points if p["timestamp"] >= cutoff]
+    if len(points) <= SESSION_POINTS_MAX_COUNT:
+        return points
+    step = (len(points) - 1) / (SESSION_POINTS_MAX_COUNT - 1)
+    picked = sorted({round(i * step) for i in range(SESSION_POINTS_MAX_COUNT)})
+    if picked[-1] != len(points) - 1:
+        picked[-1] = len(points) - 1
+    return [points[i] for i in picked]
+
+
 # ── 静态文件缓存（启动时预加载 + 预压缩） ──
 _static_cache = {}
 _GZIP_TYPES = (".js", ".css", ".html", ".svg", ".json", ".txt")
+
+# 匹配 HTML 里引用的 /static/*.js|.css 链接（含相对路径和已有 ?v= 查询）
+_FINGERPRINT_RE = re.compile(
+    r'(?P<pre>(?:src|href)=")(?P<path>/?static/[^"]*?\.(?:js|css))(?P<rest>[^"]*")'
+)
+
+
+def _fingerprint_html(raw: bytes) -> bytes:
+    """把 HTML 里静态资源链接统一带上 ?v=<内容哈希>，改动静态文件后无需手动递增版本号。
+
+    只在启动加载 HTML 时算一次 md5，运行期请求零额外计算。
+    """
+    text = raw.decode("utf-8")
+
+    def repl(m):
+        entry = _static_cache.get("/" + m.group("path").lstrip("/"))
+        if entry is None:
+            return m.group(0)
+        return f'{m.group("pre")}{m.group("path")}?v={entry["fingerprint"]}"'
+
+    return _FINGERPRINT_RE.sub(repl, text).encode("utf-8")
 
 
 def _cache_static_files():
@@ -1293,26 +1478,40 @@ def _cache_static_files():
             "raw": raw,
             "gzipped": gzipped,
             "content_type": ct,
+            # 内容哈希，供 HTML 静态资源自动版本化引用
+            "fingerprint": hashlib.md5(raw).hexdigest()[:8],
         }
-    # 根目录 HTML 文件也加入缓存
+    # 根目录 HTML 文件也加入缓存（附内容 ETag，配合 no-cache 实现未变时 304）
     for html_name in ("index.html", "phone.html", "config.html"):
         html_path = WEB_DIR / html_name
         if html_path.is_file():
-            raw = html_path.read_bytes()
+            raw = _fingerprint_html(html_path.read_bytes())
             compressed = gzip.compress(raw)
             gzipped = compressed if len(compressed) < len(raw) else None
             _static_cache[f"/{html_name}"] = {
                 "raw": raw,
                 "gzipped": gzipped,
                 "content_type": "text/html",
+                "etag": f'"{hashlib.md5(raw).hexdigest()}"',
             }
 
 
 async def handle_cached_static(request):
-    """从内存缓存响应静态文件，避免磁盘 I/O 和运行时 gzip。"""
+    """从内存缓存响应静态文件，避免磁盘 I/O 和运行时 gzip。
+
+    HTML 页面用 no-cache + ETag：页面内容更新（含引用资源的 ?v= 变化）能立即被浏览器拿到；
+    静态资源保持 immutable 长缓存，更新靠引用处的 ?v= 递增。
+    """
     entry = _static_cache.get(request.path)
     if entry is None:
         raise web.HTTPNotFound()
+    is_html = entry["content_type"] == "text/html"
+    if is_html and entry.get("etag"):
+        if request.headers.get("If-None-Match") == entry["etag"]:
+            return web.Response(status=304, headers={
+                "ETag": entry["etag"],
+                "Cache-Control": "no-cache",
+            })
     accept_gzip = request.headers.get("Accept-Encoding", "").find("gzip") != -1
     if accept_gzip and entry["gzipped"]:
         body = entry["gzipped"]
@@ -1320,15 +1519,17 @@ async def handle_cached_static(request):
             "Content-Type": entry["content_type"],
             "Content-Encoding": "gzip",
             "Content-Length": str(len(body)),
-            "Cache-Control": "public, max-age=604800, immutable",
+            "Cache-Control": "no-cache" if is_html else "public, max-age=604800, immutable",
         }
     else:
         body = entry["raw"]
         headers = {
             "Content-Type": entry["content_type"],
             "Content-Length": str(len(body)),
-            "Cache-Control": "public, max-age=604800, immutable",
+            "Cache-Control": "no-cache" if is_html else "public, max-age=604800, immutable",
         }
+    if is_html and entry.get("etag"):
+        headers["ETag"] = entry["etag"]
     return web.Response(body=body, headers=headers)
 
 
@@ -1464,9 +1665,12 @@ app.router.add_get("/api/chart", lambda r: get_server().handle_chart(r))
 app.router.add_get("/api/statistics/{port}", lambda r: get_server().handle_statistics(r))
 app.router.add_get("/api/export/{port}", lambda r: get_server().handle_export(r))
 app.router.add_get("/api/bemfa", lambda r: get_server().handle_bemfa(r))
+app.router.add_get("/api/ble-events", lambda r: get_server().handle_ble_events(r))
 app.router.add_get("/api/sessions", lambda r: get_server().handle_sessions(r))
 app.router.add_get("/api/sessions/{id}/points", lambda r: get_server().handle_session_points(r))
-app.router.add_get("/api/energy/stats", lambda r: get_server().handle_energy_stats(r))
+app.router.add_post("/api/sessions/clear", lambda r: get_server().handle_sessions_clear(r))
+app.router.add_get("/api/charge_tracking", lambda r: get_server().handle_get_charge_tracking(r))
+app.router.add_post("/api/charge_tracking", lambda r: get_server().handle_set_charge_tracking(r))
 app.router.add_get("/api/events", lambda r: get_server().handle_sse(r))
 app.router.add_get("/api/config", lambda r: get_server().handle_config_get(r))
 app.router.add_post("/api/config", lambda r: get_server().handle_config_save(r))
@@ -1492,6 +1696,7 @@ async def on_startup(app_):
             "bemfa": s.bemfa.quality() if s.bemfa else {"score": 0, "uptime": 0, "ping_lost": 0, "reconnect_count": 0},
         })
         s.history.connect()
+        s.history.set_point_interval(s.ble.config.charge_tracking.point_interval_sec)
         s.ble.set_history(s.history)
         await s.setup_mqtt()
         if s.mqtt_client:

@@ -38,11 +38,11 @@ class TestPIIDDisplay:
     def test_screen_save_time_options(self):
         """Test screen save time display values."""
         display = PIID_DISPLAY[6]
-        assert display[0] == "5分钟"
-        assert display[1] == "1分钟"
+        assert display[1] == "5分钟"
         assert display[2] == "10分钟"
         assert display[3] == "30分钟"
         assert display[4] == "常亮"
+        assert display[5] == "1分钟"
 
     def test_language_options(self):
         """Test language display values."""
@@ -63,8 +63,8 @@ class TestSelectOptionMap:
 
     def test_screen_save_time_map(self):
         """Test screen save time option mapping."""
-        assert SELECT_OPTION_MAP[6]["5分钟"] == 0
-        assert SELECT_OPTION_MAP[6]["1分钟"] == 1
+        assert SELECT_OPTION_MAP[6]["1分钟"] == 5
+        assert SELECT_OPTION_MAP[6]["5分钟"] == 1
         assert SELECT_OPTION_MAP[6]["10分钟"] == 2
         assert SELECT_OPTION_MAP[6]["30分钟"] == 3
         assert SELECT_OPTION_MAP[6]["常亮"] == 4

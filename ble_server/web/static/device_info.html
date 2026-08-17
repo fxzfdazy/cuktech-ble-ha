@@ -287,11 +287,13 @@
         function updateSummary(ports) {
             let totalPower = 0, activeCount = 0, maxV = 0;
             for (const [id, port] of Object.entries(ports || {})) {
-                if ((port.current > 0 || port.power > 0) && port.enabled !== false) {
+                if (port.enabled === false) continue;
+                if (port.current > 0 || port.power > 0) {
                     totalPower += port.power;
                     activeCount++;
-                    maxV = Math.max(maxV, port.voltage);
                 }
+                // 最高电压按端口实际电压统计，空载挂载态（v>0/i=0）也算
+                if (port.voltage > 0) maxV = Math.max(maxV, port.voltage);
             }
             document.getElementById('totalPower').textContent = totalPower.toFixed(1);
             document.getElementById('activePorts').textContent = activeCount;

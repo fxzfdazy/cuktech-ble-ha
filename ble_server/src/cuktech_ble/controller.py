@@ -57,6 +57,7 @@ class CuktechBLEController:
         self.client = None
         self.authenticated = False
         self._notify_queues = {}
+        self._disconnected = False  # set by Bleak disconnect callback on link loss
         self._send_it = 0
         self._dev_it_hi = 0      # device push counter high 16 bits (it rollover tracking)
         self._last_dev_it_lo = 0 # last device push it low 16 bits (rollover detect)
@@ -65,6 +66,9 @@ class CuktechBLEController:
         self._miot_seq = 1
         self._session_keys = None
         self.init_push_frames = []  # 认证后初始推送的 inline 帧
+        # GET/SET 等待期间收到端口推送时的处理回调（避免回放同队列导致
+        # 等待方反复取到自身回放帧空转），由上层注册
+        self.on_port_push = None
 
     def _make_notify_handler(self, name):
         """创建通知回调函数 (基于队列，避免竞态条件)。"""
@@ -163,8 +167,30 @@ class CuktechBLEController:
     async def connect(self):
         """连接到设备。"""
         _LOGGER.info("Connecting to %s...", self.mac)
+        self._disconnected = False
         self.client = BleakClient(self.mac)
         await self.client.connect()
+
+        # 显式确保 GATT 服务发现完成
+        # BlueZ 在快速重连时可能复用失效缓存，导致后续 start_notify/write_gatt_char
+        # 报 "Service Discovery has not been performed yet"
+        # Bleak 3.x: services 是 property，访问它会触发并等待服务发现完成
+        try:
+            await asyncio.wait_for(self._ensure_services(), timeout=15)
+            _LOGGER.info("GATT services discovered")
+        except asyncio.TimeoutError:
+            _LOGGER.error("GATT service discovery timeout (15s)")
+            await self.client.disconnect()
+            raise ConnectionError("GATT service discovery timeout")
+        except Exception as e:
+            _LOGGER.error("GATT service discovery failed: %s", e)
+            await self.client.disconnect()
+            raise ConnectionError(f"GATT service discovery failed: {e}")
+
+        # NOTE: Bleak 3.x removed set_disconnected_callback / on_disconnect — there
+        # is no callback API. Link loss is instead detected in the main loop by
+        # polling `client.is_connected` (Bleak 3.x keeps it updated from BlueZ
+        # Disconnected events) plus the last_notify watchdog.
         # Bleak (>=0.20, here 3.0.x) auto-negotiates MTU during connect; there is
         # no manual _acquire_mtu() anymore. Read the negotiated value for
         # diagnostics. A small MTU (23) fragments port push frames — log it so
@@ -188,20 +214,43 @@ class CuktechBLEController:
             (CHAR_CMD_SEND, "cmd_send"),
             (CHAR_DEVICE_INFO, "dev_info"),
         ]:
-            try:
-                await self.client.start_notify(char, self._make_notify_handler(name))
-            except Exception as e:
-                _LOGGER.warning("Failed to subscribe %s: %s", name, e)
+            for attempt in range(3):
+                try:
+                    await self.client.start_notify(char, self._make_notify_handler(name))
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        _LOGGER.warning("start_notify %s failed (attempt %d): %s, retrying...",
+                                        name, attempt + 1, e)
+                        await asyncio.sleep(1)
+                    else:
+                        _LOGGER.warning("Failed to subscribe %s after 3 attempts: %s", name, e)
 
         # 第二批: auth_data (密钥交换前订阅)
-        try:
-            await self.client.start_notify(CHAR_AUTH_DATA, self._make_notify_handler("auth_data"))
-        except Exception as e:
-            _LOGGER.warning("Failed to subscribe auth_data: %s", e)
+        for attempt in range(3):
+            try:
+                await self.client.start_notify(CHAR_AUTH_DATA, self._make_notify_handler("auth_data"))
+                break
+            except Exception as e:
+                if attempt < 2:
+                    _LOGGER.warning("start_notify auth_data failed (attempt %d): %s, retrying...",
+                                    attempt + 1, e)
+                    await asyncio.sleep(1)
+                else:
+                    _LOGGER.warning("Failed to subscribe auth_data after 3 attempts: %s", e)
 
         _LOGGER.info("Notification channels subscribed (deferred auth_ctrl)")
 
         return True
+
+    async def _ensure_services(self):
+        """触发并等待 GATT 服务发现完成。
+
+        Bleak 3.x 移除了 get_services()，services 改为 property；
+        在协程中访问该 property 使其阻塞至发现完成，便于外层 wait_for 超时控制。
+        """
+        _ = self.client.services
+        return self.client.services
 
     async def stop_all_notifications(self):
         """取消所有已订阅的 GATT 通知通道。
@@ -894,15 +943,16 @@ class CuktechBLEController:
                 return {'piid': piid, 'value': val, 'raw': pt}
 
             # Don't swallow live port pushes received while awaiting SET ACK/
-            # Result — replay them so the main loop processes them normally.
-            if (b4 == 0x02 and pt_siid == 2 and 1 <= pt_piid <= 4):
-                q = self._notify_queues.get("cmd_recv")
-                if q and data and len(data) >= 3 and data[2] == 0x02:
+            # Result — hand them to the callback so the main loop logic
+            # processes them immediately. 端口推送帧 b4=0x04（与 ble_manager
+            # 解码判断一致）
+            if (b4 in (0x02, 0x04) and pt_siid == 2 and 1 <= pt_piid <= 4):
+                if self.on_port_push is not None:
                     try:
-                        q.put_nowait(data)
-                        continue
-                    except asyncio.QueueFull:
-                        pass
+                        await self.on_port_push(data)
+                    except Exception as e:
+                        _LOGGER.warning("port push callback error: %s", e)
+                    continue
 
         if got_ack:
             _LOGGER.debug("SET acknowledged (ACK only)")
@@ -938,19 +988,17 @@ class CuktechBLEController:
                         result_value = pt[13] if len(pt) > 13 else None
                 return {'piid': piid, 'value': result_value, 'raw': pt}
 
-            # Not our GET response. If it's a live port push (b4==0x02, siid==2,
-            # piid 1..4), don't swallow it — put the raw frame back so the main
-            # loop processes it as normal port data. ACK was already sent in
-            # _try_decode_inline, so the device won't re-push.
-            if (b4 == 0x02 and pt_siid == 2 and 1 <= pt_piid <= 4):
-                q = self._notify_queues.get("cmd_recv")
-                if q and data and len(data) >= 3 and data[2] == 0x02:
+            # Not our GET response. If it's a live port push (b4==0x04, siid==2,
+            # piid 1..4), don't swallow it — hand it to the callback so the
+            # main loop logic processes it immediately. ACK was already sent
+            # in _try_decode_inline, so the device won't re-push.
+            if (b4 in (0x02, 0x04) and pt_siid == 2 and 1 <= pt_piid <= 4):
+                if self.on_port_push is not None:
                     try:
-                        q.put_nowait(data)
-                        continue
-                    except asyncio.QueueFull:
-                        pass
-                # fall through: drop if replay fails (rare)
+                        await self.on_port_push(data)
+                    except Exception as e:
+                        _LOGGER.warning("port push callback error: %s", e)
+                    continue
 
         _LOGGER.debug("GET no response")
         return None

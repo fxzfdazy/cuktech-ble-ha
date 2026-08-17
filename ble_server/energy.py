@@ -1,6 +1,4 @@
 """CUKTECH BLE Server - Energy accumulation with adaptive integration."""
-import statistics
-from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -10,8 +8,6 @@ class PortEnergyState:
     """Per-port energy tracking state."""
     total_wh: float = 0.0
     session_wh: float = 0.0
-    daily_wh: float = 0.0
-    daily_date: str = ""
     is_charging: bool = False
     session_start: Optional[float] = None
     last_power: float = 0.0
@@ -57,7 +53,6 @@ class AdaptiveEnergyIntegrator:
 
         state.total_wh += energy
         state.session_wh += energy
-        state.daily_wh += energy
         state.last_power = power
         state.last_time = timestamp
         if power > state.max_power:
@@ -68,50 +63,34 @@ class AdaptiveEnergyIntegrator:
         return state.total_wh
 
 
-class ChargeEndDetector:
-    """Determines charging session boundaries using power-based threshold.
+class PowerThresholdDetector:
+    """功率阈值检测器：判断功率低于阈值是否持续足够久。
 
-    Strategy: session ends when avg power < 1W for 10 consecutive minutes,
-    regardless of voltage. This catches both gradual trickle-down and
-    sudden disconnect scenarios.
+    无滑动窗口，仅维护一个时间戳，CPU 开销极低。
+    仅在配置了 end_power_w > 0 时由 ble_manager 启用。
     """
 
-    LOW_POWER_DURATION_SEC = 600  # 10 minutes
-    COOLDOWN_SEC = 30
+    DEFAULT_DURATION_SEC = 30  # 默认持续时长，可被构造参数覆盖
 
-    def __init__(self):
-        self._low_power_start: Optional[float] = None
-        self._cooldown_until: float = 0
-        self._power_window: deque = deque(maxlen=1800)
+    def __init__(self, duration_sec: int = DEFAULT_DURATION_SEC):
+        self.duration_sec = duration_sec  # 功率低于阈值持续该秒数后判定结束
+        self._low_since = None  # 记录功率首次低于阈值的时间戳
 
-    def update(self, power: float, timestamp: float):
-        """Track power over time."""
-        self._power_window.append(power)
+    def should_end(self, power: float, threshold: float, timestamp: float) -> bool:
+        """判断是否应结束会话（功率 < threshold 持续 duration_sec 秒）。
 
-    def should_end_session(self, state: PortEnergyState, timestamp: float) -> bool:
-        """Check if charging session should end (avg power < 1W for 10min)."""
-        if timestamp < self._cooldown_until:
+        threshold 为 0 时直接返回 False（未启用阈值模式）。
+        """
+        if threshold <= 0:
             return False
-
-        if len(self._power_window) < 300:
-            return False
-
-        avg = statistics.mean(list(self._power_window)[-300:])
-        # End session when avg power < 1W (roughly 0.05A at 20V or 0.2A at 5V)
-        threshold = 1.0
-
-        if avg < threshold:
-            if self._low_power_start is None:
-                self._low_power_start = timestamp
-            if timestamp - self._low_power_start > self.LOW_POWER_DURATION_SEC:
-                return True
+        if power < threshold:
+            if self._low_since is None:
+                self._low_since = timestamp
+            return (timestamp - self._low_since) >= self.duration_sec
         else:
-            self._low_power_start = None
+            self._low_since = None
+            return False
 
-        return False
-
-    def on_session_end(self, timestamp: float):
-        """Reset state after session ends."""
-        self._cooldown_until = timestamp + self.COOLDOWN_SEC
-        self._low_power_start = None
-        self._power_window.clear()
+    def reset(self):
+        """会话开始/结束时重置状态。"""
+        self._low_since = None

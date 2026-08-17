@@ -137,7 +137,7 @@
 
         const SETTINGS_CONFIG = [
             { piid: 5, name: '场景模式', options: [{ value: 1, label: 'AI模式' }, { value: 2, label: '数码生态' }, { value: 3, label: '单口模式' }, { value: 4, label: '均衡模式' }] },
-            { piid: 6, name: '息屏时间', options: [{ value: 0, label: '5分钟' }, { value: 1, label: '1分钟' }, { value: 2, label: '10分钟' }, { value: 3, label: '30分钟' }, { value: 4, label: '常亮' }, { value: 5, label: '1分钟' }] },
+            { piid: 6, name: '息屏时间', options: [{ value: 5, label: '1分钟' }, { value: 1, label: '5分钟' }, { value: 2, label: '10分钟' }, { value: 3, label: '30分钟' }, { value: 4, label: '常亮' }] },
             { piid: 13, name: '语言', options: [{ value: 0, label: 'English' }, { value: 1, label: '中文' }] },
             { piid: 15, name: 'USB-A小电流', options: [{ value: 0, label: '关闭' }, { value: 1, label: '开启' }] },
             { piid: 19, name: '空闲息屏', options: [{ value: 0, label: '关闭' }, { value: 1, label: '开启' }] },
@@ -479,11 +479,13 @@
         function updateSummary(ports) {
             let totalPower = 0, activeCount = 0, maxV = 0;
             for (const [id, port] of Object.entries(ports || {})) {
-                if ((port.current > 0 || port.power > 0) && port.enabled !== false) {
+                if (port.enabled === false) continue;
+                if (port.current > 0 || port.power > 0) {
                     totalPower += port.power;
                     activeCount++;
-                    maxV = Math.max(maxV, port.voltage);
                 }
+                // 最高电压按端口实际电压统计，空载挂载态（v>0/i=0）也算
+                if (port.voltage > 0) maxV = Math.max(maxV, port.voltage);
             }
             document.getElementById('totalPower').textContent = totalPower.toFixed(1);
             const apEl = document.getElementById('activePorts');
@@ -510,11 +512,17 @@
                 protoEl.textContent = merged.protocol;
                 protoEl.style.color = merged.protocol !== 'idle' ? 'var(--accent)' : 'var(--text-dim)';
             }
-            // Update active class (enabled comes from PIID 16, not BLE data)
-            card.classList.toggle('active', merged.enabled !== false);
-            // Update toggle checkbox
+            // 开关与卡片状态：pending 保持到服务器确认新状态为止，期间不被旧推送覆盖
             const toggle = document.getElementById(`toggle-${PORT_KEY_MAP[portId]}`);
-            if (toggle) toggle.checked = merged.enabled !== false;
+            const portKey = PORT_KEY_MAP[portId];
+            const serverEnabled = merged.enabled !== false;
+            if (pendingPortToggles[portKey] === serverEnabled) delete pendingPortToggles[portKey];
+            if (pendingPortToggles.hasOwnProperty(portKey) || isRecent()) {
+                if (toggle) card.classList.toggle('active', toggle.checked);
+            } else {
+                card.classList.toggle('active', serverEnabled);
+                if (toggle) toggle.checked = serverEnabled;
+            }
             // Update summary totals
             updateSummary(latestPorts);
             // Update modal if open for this port
@@ -542,41 +550,68 @@
             }
         }
 
+        // 端口开关 pending：key -> 目标状态。请求期间不被服务器状态覆盖，防止慢响应时开关跳回旧值
+        const pendingPortToggles = {};
+        let portsRendered = false;
+
         function renderPorts(ports) {
             const grid = document.getElementById('portGrid');
-            // Save current toggle states during recent-change window
-            const savedChecks = {};
-            if (isRecent()) {
-                for (const [id] of Object.entries(PORT_MAP)) {
+            if (!portsRendered) {
+                let html = '';
+                for (const [id, name] of Object.entries(PORT_MAP)) {
+                    const port = ports[id] || { voltage: 0, current: 0, power: 0, enabled: false, protocol: 'idle' };
                     const key = PORT_KEY_MAP[id];
-                    const t = document.getElementById(`toggle-${key}`);
-                    if (t) savedChecks[key] = t.checked;
-                }
-            }
-            let html = '';
-            for (const [id, name] of Object.entries(PORT_MAP)) {
-                const port = ports[id] || { voltage: 0, current: 0, power: 0, enabled: false, protocol: 'idle' };
-                const key = PORT_KEY_MAP[id];
-                const protocolColor = port.protocol !== 'idle' ? 'var(--accent)' : 'var(--text-dim)';
-                const checked = (isRecent() && savedChecks.hasOwnProperty(key)) ? savedChecks[key] : port.enabled;
-                html += `
-                    <div class="port-card ${checked ? 'active' : ''}" id="port-${id}" onclick="handlePortClick(event, ${id})">
+                    const protocolColor = port.protocol !== 'idle' ? 'var(--accent)' : 'var(--text-dim)';
+                    html += `
+                    <div class="port-card ${port.enabled ? 'active' : ''}" id="port-${id}" onclick="handlePortClick(event, ${id})">
                         <div class="port-header">
                             <span class="port-name ${key}">${name}</span>
                             <label class="port-toggle" onclick="event.stopPropagation()">
-                                <input type="checkbox" id="toggle-${key}" ${checked ? 'checked' : ''} onchange="togglePort('${key}', this.checked)">
+                                <input type="checkbox" id="toggle-${key}" ${port.enabled ? 'checked' : ''} onchange="togglePort('${key}', this.checked)">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
                         <div class="port-stats">
-                            <div class="port-stat"><div class="port-stat-value">${port.voltage.toFixed(1)}</div><div class="port-stat-label">电压 V</div></div>
-                            <div class="port-stat"><div class="port-stat-value">${port.current.toFixed(1)}</div><div class="port-stat-label">电流 A</div></div>
-                            <div class="port-stat"><div class="port-stat-value">${port.power.toFixed(1)}</div><div class="port-stat-label">功率 W</div></div>
+                            <div class="port-stat"><div class="port-stat-value" id="stat-v-${key}">${port.voltage.toFixed(1)}</div><div class="port-stat-label">电压 V</div></div>
+                            <div class="port-stat"><div class="port-stat-value" id="stat-a-${key}">${port.current.toFixed(1)}</div><div class="port-stat-label">电流 A</div></div>
+                            <div class="port-stat"><div class="port-stat-value" id="stat-w-${key}">${port.power.toFixed(1)}</div><div class="port-stat-label">功率 W</div></div>
                         </div>
-                        <div class="port-protocol" style="text-align:center;margin-top:8px;font-size:11px;color:${protocolColor}">${port.protocol}</div>
+                        <div class="port-protocol" id="proto-${key}" style="text-align:center;margin-top:8px;font-size:11px;color:${protocolColor}">${port.protocol}</div>
                     </div>`;
+                }
+                grid.innerHTML = html;
+                portsRendered = true;
+                return;
             }
-            grid.innerHTML = html;
+            // 原地更新：不重建 DOM，避免打断开关过渡动画、丢失 disabled 状态
+            for (const [id] of Object.entries(PORT_MAP)) {
+                const port = ports[id] || { voltage: 0, current: 0, power: 0, enabled: false, protocol: 'idle' };
+                const key = PORT_KEY_MAP[id];
+                const card = document.getElementById(`port-${id}`);
+                if (!card) continue;
+                const vEl = document.getElementById(`stat-v-${key}`);
+                if (vEl) vEl.textContent = port.voltage.toFixed(1);
+                const aEl = document.getElementById(`stat-a-${key}`);
+                if (aEl) aEl.textContent = port.current.toFixed(1);
+                const wEl = document.getElementById(`stat-w-${key}`);
+                if (wEl) wEl.textContent = port.power.toFixed(1);
+                const protoEl = document.getElementById(`proto-${key}`);
+                if (protoEl) {
+                    protoEl.textContent = port.protocol;
+                    protoEl.style.color = port.protocol !== 'idle' ? 'var(--accent)' : 'var(--text-dim)';
+                }
+                const toggle = document.getElementById(`toggle-${key}`);
+                if (toggle) {
+                    // 服务器已确认新状态则解除 pending；pending 期间保持本地目标不被覆盖
+                    if (pendingPortToggles[key] === port.enabled) delete pendingPortToggles[key];
+                    if (!pendingPortToggles.hasOwnProperty(key) && !isRecent() && toggle.checked !== port.enabled) {
+                        toggle.checked = port.enabled;
+                    }
+                    card.classList.toggle('active', toggle.checked);
+                } else {
+                    card.classList.toggle('active', port.enabled);
+                }
+            }
         }
 
         function handlePortClick(event, portId) {
@@ -604,21 +639,28 @@
 
         async function togglePort(port, on) {
             markLocal();
+            pendingPortToggles[port] = on;
             const toggle = document.getElementById(`toggle-${port}`);
             if (toggle) toggle.disabled = true;
+            let ok = false;
             try {
                 const res = await fetch(`${API_BASE}/api/port`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port, action: on ? 'on' : 'off' }) });
                 const result = await res.json();
-                if (!result.ok) {
-                    if (toggle) toggle.checked = !on;
-                }
+                ok = !!result.ok;
             } catch (e) {
                 console.error('Port toggle error:', e);
-                if (toggle) toggle.checked = !on;
-            } finally {
-                if (toggle) toggle.disabled = false;
-                // SSE port_update will update UI automatically
             }
+            if (!ok) {
+                // 请求失败：解除 pending 并回滚
+                delete pendingPortToggles[port];
+                if (toggle) toggle.checked = !on;
+            }
+            // 成功后保留 pending，待服务器推送确认新状态时由 renderPorts/updatePortDOM 解除，防止旧值闪回
+            if (toggle) toggle.disabled = false;
+            const cardId = PORT_KEY_TO_ID[port];
+            const card = document.getElementById(`port-${cardId}`);
+            if (card && toggle) card.classList.toggle('active', toggle.checked);
+            // SSE port_update will update UI automatically
         }
 
         async function setSetting(piid, value) {
@@ -742,6 +784,37 @@
                 // SSE status event will update UI when connection state changes
             } catch (e) { console.error('BLE restart error:', e); }
             finally { btn.disabled = false; }
+        }
+
+        async function openBleLogModal() {
+            document.getElementById('bleLogModal').classList.add('show');
+            await fetchBleEvents();
+        }
+        function closeBleLogModal() {
+            document.getElementById('bleLogModal').classList.remove('show');
+        }
+        async function fetchBleEvents() {
+            try {
+                const res = await fetch(`${API_BASE}/api/ble-events`);
+                const data = await res.json();
+                renderBleEvents(data.events || []);
+            } catch (e) { console.error('Fetch BLE events error:', e); }
+        }
+        function renderBleEvents(events) {
+            const el = document.getElementById('bleLogList');
+            if (!el) return;
+            if (!events.length) { el.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px;">暂无日志</div>'; return; }
+            const colorMap = { connect: 'var(--success)', reconnect_ok: 'var(--success)',
+                               disconnect: 'var(--danger)', auth_fail: 'var(--danger)',
+                               reconnect_fail: 'var(--danger)', probe_fail: 'var(--warning)',
+                               refresh_fail: 'var(--warning)', keepalive_fail: 'var(--warning)',
+                               reconnect_attempt: 'var(--text-dim)' };
+            el.innerHTML = events.slice().reverse().map(e =>
+                `<div style="padding:6px 8px;border-bottom:1px solid var(--card-border);">
+                    <span style="color:var(--text-dim);">${e.timestamp}</span>
+                    <span style="color:${colorMap[e.event]||'var(--text)'};font-weight:600;margin:0 6px;">[${e.event}]</span>
+                    <span>${e.message}</span>
+                </div>`).join('');
         }
 
         async function fetchBemfaStatus() {
@@ -868,6 +941,12 @@
                         case 'quality':
                             renderQuality(msg);
                             break;
+                        case 'ble_event':
+                            if (document.getElementById('bleLogModal') &&
+                                document.getElementById('bleLogModal').classList.contains('show')) {
+                                fetchBleEvents();
+                            }
+                            break;
                     }
                 } catch (err) { console.error('SSE parse error:', err); }
             };
@@ -977,14 +1056,16 @@
             const badge = document.getElementById('sceneBadgeAni');
             if (!unconnected || !charger) return;
 
-            let totalW = 0;
+            let totalW = 0, hasCable = false;
             for (const [id, port] of Object.entries(ports || {})) {
+                if (port.enabled !== false && port.active) hasCable = true;
                 if (port.enabled !== false && port.power > 0) totalW += port.power;
             }
 
             const wrapInner = document.querySelector('.device-wrap-inner');
 
-            if (totalW > 0) {
+            // 有线插入即显示设备与端口模块（0W 也显示），功率只改数字
+            if (hasCable) {
                 unconnected.classList.remove('show');
                 if (wrapInner) wrapInner.classList.remove('idle');
                 charger.classList.add('charging');
@@ -993,10 +1074,10 @@
 
                 const portKeys = ['c1','c2','c3','a'];
                 for (const key of portKeys) {
-                    const p = ports[String(PORT_KEY_TO_ID[key])] || { voltage:0, current:0, power:0, enabled:false, protocol:'idle' };
+                    const p = ports[String(PORT_KEY_TO_ID[key])] || { voltage:0, current:0, power:0, active:false, enabled:false, protocol:'idle' };
                     const mod = document.getElementById('usbMod' + key.toUpperCase());
                     const pval = document.getElementById('usbPval' + key.toUpperCase());
-                    const active = p.enabled && p.power > 0;
+                    const active = p.enabled && p.active;
                     if (mod) mod.classList.toggle('active', active);
                     if (pval) pval.textContent = active ? p.power.toFixed(1) + 'W' : '0W';
                 }
@@ -1020,7 +1101,7 @@
             window.onChartReady = initApp;
         }
 
-        // Charge History auto-refresh
-        if (typeof startChargeHistoryAutoRefresh === 'function') {
-            startChargeHistoryAutoRefresh('chargeSessionList', 'chargeStats', 'today', 2000);
+        // 充电记录板块初始化
+        if (typeof initChargeHistory === 'function') {
+            initChargeHistory();
         }

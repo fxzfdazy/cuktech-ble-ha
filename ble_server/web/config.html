@@ -166,6 +166,67 @@ body.light .config-select { border-color: rgba(0,0,0,0.12); }
             </div>
         </div>
 
+        <!-- Charge Tracking Config -->
+        <div class="card config-section">
+            <div class="config-section-title">充电记录设置</div>
+            <div class="config-row">
+                <div class="config-label">C1 记录</div>
+                <label class="toggle"><input type="checkbox" id="trackC1" checked><span class="toggle-slider"></span></label>
+            </div>
+            <div class="config-row">
+                <div class="config-label">C2 记录</div>
+                <label class="toggle"><input type="checkbox" id="trackC2"><span class="toggle-slider"></span></label>
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">C1 起始功率阈值(W)</div><div class="config-hint">高于此值开始记录</div></div>
+                <input class="config-input" id="startPowerW1" type="number" min="0" step="0.1" placeholder="0=按插拔" style="width:120px;">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">C1 截止功率阈值(W)</div><div class="config-hint">低于此值持续30秒结束</div></div>
+                <input class="config-input" id="endPowerW1" type="number" min="0" step="0.1" placeholder="0=按插拔" style="width:120px;">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">C2 起始功率阈值(W)</div><div class="config-hint">高于此值开始记录</div></div>
+                <input class="config-input" id="startPowerW2" type="number" min="0" step="0.1" placeholder="0=按插拔" style="width:120px;">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">C2 截止功率阈值(W)</div><div class="config-hint">低于此值持续判定时长后结束</div></div>
+                <input class="config-input" id="endPowerW2" type="number" min="0" step="0.1" placeholder="0=按插拔" style="width:120px;">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">截止判定持续时长(秒)</div><div class="config-hint">功率持续低于阈值该秒数才结束</div></div>
+                <input class="config-input" id="endPowerDurationSec" type="number" min="1" step="1" placeholder="30" style="width:120px;">
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">拔线容错</div><div class="config-hint">拔出后该秒数内重新插上则延续同一次记录</div></div>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <input class="config-input" id="unplugGraceSec" type="number" min="1" step="1" placeholder="10" style="width:70px;" disabled>
+                    <span class="config-hint" style="white-space:nowrap;">秒</span>
+                    <label class="toggle"><input type="checkbox" id="unplugGraceEnabled" onchange="document.getElementById('unplugGraceSec').disabled=!this.checked"><span class="toggle-slider"></span></label>
+                </div>
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">采样精度</div><div class="config-hint">功率图表与充电曲线的采样间隔，容量统计不受影响</div></div>
+                <select id="pointIntervalSec" class="config-input">
+                    <option value="10">精细 (10秒)</option>
+                    <option value="30" selected>标准 (30秒)</option>
+                    <option value="60">省电 (60秒)</option>
+                    <option value="120">极省 (120秒)</option>
+                </select>
+            </div>
+            <div class="config-row">
+                <div><div class="config-label">显示精度</div><div class="config-hint">充电记录的时间与时长显示，改动即时生效</div></div>
+                <select id="displayPrecision" class="config-input" style="width:130px;" onchange="setDisplayPrecision(this.value)">
+                    <option value="sec">精确到秒</option>
+                    <option value="min">精确到分</option>
+                </select>
+            </div>
+            <div class="config-hint" style="padding:10px 4px 0;line-height:1.5;">阈值按端口独立生效：填 0 表示按端口插拔触发；填大于 0 的数值时改为按功率阈值触发，拔出仍作为强制结束兜底（开启拔线容错时改为等待重插）。USB-A 口不记录充电。独立保存，无需重启服务。</div>
+            <button class="btn-save" id="btnSaveTracking" onclick="saveChargeTracking()" style="margin-top:8px;">
+                <span id="btnSaveTrackingText">保存充电记录设置</span>
+            </button>
+        </div>
+
         <!-- Status -->
         <div class="card config-section">
             <div class="config-section-title">当前状态</div>
@@ -214,6 +275,16 @@ function showToast(msg, duration) {
     t.style.opacity = '1';
     setTimeout(() => { t.style.opacity = '0'; }, duration || 3000);
 }
+
+// 显示精度：纯本地偏好（localStorage），首页/手机页实时读取，不经过后端
+function setDisplayPrecision(v) {
+    localStorage.setItem('chShowSeconds', v === 'sec' ? '1' : '0');
+    showToast(v === 'sec' ? '已切换为精确到秒' : '已切换为精确到分');
+}
+(function() {
+    const sel = document.getElementById('displayPrecision');
+    if (sel) sel.value = localStorage.getItem('chShowSeconds') === '0' ? 'min' : 'sec';
+})();
 
 async function loadConfig() {
     try {
@@ -311,7 +382,96 @@ async function saveConfig() {
     }
 }
 
+// 加载充电记录配置（走独立的 /api/charge_tracking 接口，不随主配置）
+async function loadChargeTracking() {
+    try {
+        const res = await fetch(`${API}/api/charge_tracking`);
+        const data = await res.json();
+        // 兼容 {ok, config} 与直接返回字段两种返回结构
+        const t = data.config || data;
+        const enabled = Array.isArray(t.enabled_ports) ? t.enabled_ports : [];
+        document.getElementById('trackC1').checked = enabled.includes(1);
+        document.getElementById('trackC2').checked = enabled.includes(2);
+        // 阈值按口填充：结构为 {c1,c2}，旧后端标量则两口同值；空值显示为空让 placeholder 提示 0=按插拔
+        const sp = t.start_power_w, ep = t.end_power_w;
+        const perPort = (v) => (v && typeof v === 'object') ? v : { c1: v, c2: v };
+        const spm = perPort(sp), epm = perPort(ep);
+        const setVal = (id, v) => {
+            document.getElementById(id).value = (v === 0 || v === undefined || v === null) ? '' : v;
+        };
+        setVal('startPowerW1', spm.c1); setVal('startPowerW2', spm.c2);
+        setVal('endPowerW1', epm.c1); setVal('endPowerW2', epm.c2);
+        const durSec = t.end_power_duration_sec;
+        document.getElementById('endPowerDurationSec').value = (!durSec || durSec < 1) ? 30 : durSec;
+        const graceSec = t.unplug_grace_sec;
+        const graceInput = document.getElementById('unplugGraceSec');
+        document.getElementById('unplugGraceEnabled').checked = graceSec > 0;
+        graceInput.value = (graceSec && graceSec > 0) ? graceSec : 10;
+        graceInput.disabled = !(graceSec > 0);
+        const sel = document.getElementById('pointIntervalSec');
+        if (sel) { sel.value = String(t.point_interval_sec || 60); }
+    } catch (e) {
+        showToast('充电记录配置加载失败: ' + e.message, 4000);
+    }
+}
+
+// 保存充电记录配置（独立保存，不重启服务）
+async function saveChargeTracking() {
+    const btn = document.getElementById('btnSaveTracking');
+    const btnText = document.getElementById('btnSaveTrackingText');
+    btn.disabled = true;
+    const originalText = btnText.textContent;
+    btnText.textContent = '保存中...';
+
+    const enabled_ports = [];
+    if (document.getElementById('trackC1').checked) enabled_ports.push(1);
+    if (document.getElementById('trackC2').checked) enabled_ports.push(2);
+
+    const pointIntervalSec = parseInt(document.getElementById('pointIntervalSec')?.value || '30', 10);
+    const durSecVal = parseInt(document.getElementById('endPowerDurationSec')?.value || '30', 10);
+    let graceVal = 0;
+    if (document.getElementById('unplugGraceEnabled')?.checked) {
+        graceVal = parseInt(document.getElementById('unplugGraceSec')?.value || '10', 10);
+        if (!(graceVal >= 1)) graceVal = 10;
+    }
+    const payload = {
+        enabled_ports,
+        start_power_w: {
+            c1: parseFloat(document.getElementById('startPowerW1').value) || 0,
+            c2: parseFloat(document.getElementById('startPowerW2').value) || 0,
+        },
+        end_power_w: {
+            c1: parseFloat(document.getElementById('endPowerW1').value) || 0,
+            c2: parseFloat(document.getElementById('endPowerW2').value) || 0,
+        },
+        end_power_duration_sec: (durSecVal >= 1) ? durSecVal : 30,
+        unplug_grace_sec: graceVal,
+        point_interval_sec: pointIntervalSec,
+    };
+
+    try {
+        const res = await fetch(`${API}/api/charge_tracking`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        // 兼容 {ok:true} 与直接返回字段两种返回结构
+        if (data.ok === true || data.enabled_ports !== undefined) {
+            showToast('充电记录设置已保存');
+        } else {
+            showToast('保存失败: ' + (data.error || '未知错误'), 4000);
+        }
+    } catch (e) {
+        showToast('网络错误: ' + e.message, 4000);
+    } finally {
+        btn.disabled = false;
+        btnText.textContent = originalText;
+    }
+}
+
 loadConfig();
+loadChargeTracking();
 
 // ── Xiaomi Cloud Modal ──
 let _xiaomiServer = '', _xiaomiSessionId = '', _xiaomiQRActive = false;

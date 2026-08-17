@@ -59,9 +59,6 @@ class CuktechSelect(CuktechBaseEntity, SelectEntity):
         display = PIID_DISPLAY.get(self._piid, {}).get(v)
         if display is not None:
             return display
-        # PIID 6 value=5 is firmware alias for value=1 ("1分钟")
-        if self._piid == 6 and v == 5:
-            return "1分钟"
         return None
 
     async def async_select_option(self, option: str) -> None:

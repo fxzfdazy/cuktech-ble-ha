@@ -29,6 +29,19 @@ server:
   history_retention_days: 2       # 保留最近 N 天的历史数据
   history_db_path: ""             # SQLite 数据库文件路径
 
+# 充电记录设置
+charge_tracking:
+  enabled_ports: [1]        # 记录充电的 C 口列表，可选 1/2，默认仅 C1
+  start_power_w:            # 起始功率阈值(W)按口独立，0=按插拔触发，>0=功率超过该值开始记录；写标量则两口同值
+    c1: 0
+    c2: 0
+  end_power_w:              # 截止功率阈值(W)按口独立，0=按插拔触发，>0=功率低于该值持续 end_power_duration_sec 秒结束；写标量则两口同值
+    c1: 0
+    c2: 0
+  end_power_duration_sec: 30  # 截止判定的持续时长(秒)，功率持续低于阈值该秒数才会话结束
+  unplug_grace_sec: 0        # 拔线容错(秒)，0=拔出立即结束；>0=拔出后等待该秒数，期间重新插上则延续同一会话
+  point_interval_sec: 30     # 采样间隔(秒)，影响功率图表与充电曲线精度，容量统计不受影响
+
 bemfa:
   enabled: false   # 是否启用巴法云，接入小爱同学/小度音箱
   uid: ""          # 巴法云控制台的私钥

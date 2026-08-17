@@ -2,7 +2,7 @@
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from energy import AdaptiveEnergyIntegrator, PortEnergyState, ChargeEndDetector
+from energy import AdaptiveEnergyIntegrator, PortEnergyState, PowerThresholdDetector
 
 
 def test_basic_accumulation():
@@ -57,93 +57,81 @@ def test_multiple_accumulation():
     print("PASS: test_multiple_accumulation")
 
 
-def test_charge_end_detection():
-    """Average power < 1W for 10+ minutes should trigger end."""
-    det = ChargeEndDetector()
-    state = PortEnergyState()
-    base = 1000000.0
-    # Fill window with low-power data (0.4W avg, below 1W threshold)
-    for i in range(400):
-        det.update(0.4, base + i)
-    # First call: sets _low_power_start
-    det.should_end_session(state, base + 400)
-    # Add more data 600s later
-    for i in range(400, 1000):
-        det.update(0.4, base + i)
-    # Second call: 600+ seconds of low power → trigger end (need >600)
-    assert det.should_end_session(state, base + 1001), "Should detect charge complete"
-    print("PASS: test_charge_end_detection")
+def test_power_threshold_disabled():
+    """threshold=0 表示未启用阈值模式，should_end 始终返回 False。"""
+    det = PowerThresholdDetector()
+    base = 1000.0
+    # 即使功率极低、时间任意推移，也不应触发
+    assert det.should_end(0.0, 0, base) is False
+    assert det.should_end(0.1, 0, base + 1000) is False
+    # 负阈值同样视为未启用
+    assert det.should_end(0.0, -1, base) is False
+    print("PASS: test_power_threshold_disabled")
 
 
-def test_cooldown():
-    det = ChargeEndDetector()
-    state = PortEnergyState()
-    base = 1000000.0
-    for i in range(400):
-        det.update(0.4, base + i)
-    det.should_end_session(state, base + 400)
-    for i in range(400, 1001):
-        det.update(0.4, base + i)
-    assert det.should_end_session(state, base + 1001)
-    det.on_session_end(base + 1001)
-    assert not det.should_end_session(state, base + 1001 + 10)
-    print("PASS: test_cooldown")
+def test_power_threshold_triggers_after_30s():
+    """功率低于阈值持续 30 秒后返回 True。"""
+    det = PowerThresholdDetector()
+    threshold = 2.0
+    base = 1000.0
+    # 首次低于阈值，尚未满 30 秒
+    assert det.should_end(1.0, threshold, base) is False
+    # 29 秒时仍未触发
+    assert det.should_end(1.0, threshold, base + 29) is False
+    # 满 30 秒触发
+    assert det.should_end(1.0, threshold, base + 30) is True
+    print("PASS: test_power_threshold_triggers_after_30s")
 
 
-def test_window_not_full_no_trigger():
-    """Window < 300 entries should never trigger, even with low power."""
-    det = ChargeEndDetector()
-    state = PortEnergyState()
-    base = 1000000.0
-    for i in range(299):
-        det.update(0.1, base + i)
-    assert not det.should_end_session(state, base + 300), "Window not full should not trigger"
-    print("PASS: test_window_not_full_no_trigger")
+def test_power_threshold_custom_duration():
+    """构造参数自定义持续时长后按该时长触发。"""
+    det = PowerThresholdDetector(duration_sec=10)
+    threshold = 2.0
+    base = 1000.0
+    assert det.should_end(1.0, threshold, base) is False
+    assert det.should_end(1.0, threshold, base + 9) is False
+    assert det.should_end(1.0, threshold, base + 10) is True
+    # 运行中改时长同样生效
+    det2 = PowerThresholdDetector()
+    det2.duration_sec = 5
+    det2.should_end(1.0, threshold, base)
+    assert det2.should_end(1.0, threshold, base + 5) is True
+    print("PASS: test_power_threshold_custom_duration")
 
 
-def test_cooldown_after_restart():
-    """After on_session_end, low_power_start resets, new low-power cycle must restart from zero."""
-    det = ChargeEndDetector()
-    state = PortEnergyState()
-    base = 1000000.0
-    # Fill window and trigger
-    for i in range(1000):
-        det.update(0.4, base + i)
-    det.should_end_session(state, base + 400)
-    assert det.should_end_session(state, base + 1001)
-    # End session
-    det.on_session_end(base + 1001)
-    # Immediately restart with low power — should NOT trigger because _low_power_start was reset
-    for i in range(1000):
-        det.update(0.4, base + 1002 + i)
-    assert not det.should_end_session(state, base + 1002 + 100), \
-        "After cooldown reset, new low-power cycle must not trigger early"
-    # But after 600+ seconds of sustained low power, should trigger
-    assert det.should_end_session(state, base + 1002 + 100 + 601), \
-        "Should trigger after 600s of sustained low power (timer starts at first check)"
-    print("PASS: test_cooldown_after_restart")
+def test_power_threshold_resets_on_recovery():
+    """功率恢复后 _low_since 重置，再次低于阈值需重新计满 30 秒。"""
+    det = PowerThresholdDetector()
+    threshold = 2.0
+    base = 1000.0
+    # 低于阈值累计 20 秒
+    assert det.should_end(1.0, threshold, base) is False
+    assert det.should_end(1.0, threshold, base + 20) is False
+    # 功率恢复到阈值以上
+    assert det.should_end(5.0, threshold, base + 21) is False
+    # 再次低于阈值，计时从头开始
+    assert det.should_end(1.0, threshold, base + 22) is False
+    assert det.should_end(1.0, threshold, base + 22 + 29) is False
+    # 重新满 30 秒才触发
+    assert det.should_end(1.0, threshold, base + 22 + 30) is True
+    print("PASS: test_power_threshold_resets_on_recovery")
 
 
-def test_high_power_resets_low_power_timer():
-    """High power burst resets the low-power countdown."""
-    det = ChargeEndDetector()
-    state = PortEnergyState()
-    base = 1000000.0
-    for i in range(400):
-        det.update(0.1, base + i)
-    det.should_end_session(state, base + 400)
-    # Continue low power, then high power burst near the window tail
-    for i in range(401, 1400):
-        det.update(0.1, base + i)
-    # Multiple high-power entries to push avg > 1W in last 300
-    for i in range(1400, 1450):
-        det.update(50.0, base + i)
-    for i in range(1451, 1500):
-        det.update(0.1, base + i)
-    # Should NOT trigger because high power reset the timer
-    assert not det.should_end_session(state, base + 1501), \
-        "High power burst should reset countdown"
-    print("PASS: test_high_power_resets_low_power_timer")
+def test_power_threshold_reset_method():
+    """reset() 后内部状态清空，需重新累计 30 秒才会触发。"""
+    det = PowerThresholdDetector()
+    threshold = 2.0
+    base = 1000.0
+    det.should_end(1.0, threshold, base)
+    det.should_end(1.0, threshold, base + 29)
+    assert det._low_since is not None
+    det.reset()
+    assert det._low_since is None
+    # 重置后即便时间大幅推移，首次低于阈值仍不触发
+    assert det.should_end(1.0, threshold, base + 100) is False
+    # 重新满 30 秒才触发
+    assert det.should_end(1.0, threshold, base + 100 + 30) is True
+    print("PASS: test_power_threshold_reset_method")
 
 
 if __name__ == "__main__":
@@ -152,6 +140,8 @@ if __name__ == "__main__":
     test_irregular_interval_skipped()
     test_overshoot_protection()
     test_multiple_accumulation()
-    test_charge_end_detection()
-    test_cooldown()
+    test_power_threshold_disabled()
+    test_power_threshold_triggers_after_30s()
+    test_power_threshold_resets_on_recovery()
+    test_power_threshold_reset_method()
     print("\nAll tests passed!")

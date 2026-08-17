@@ -85,11 +85,24 @@ class BemfaConfig:
 
 
 @dataclass
+class ChargeTrackingConfig:
+    enabled_ports: list = field(default_factory=lambda: [1])  # 记录充电的 C 口列表，仅支持 1/2
+    # 起始功率阈值(W)按端口独立配置，键为端口号 1/2；0=按插拔触发，>0=功率超过该值开始记录
+    start_power_w: dict = field(default_factory=lambda: {1: 0.0, 2: 0.0})
+    # 截止功率阈值(W)按端口独立配置，键为端口号 1/2；0=按插拔触发，>0=功率低于该值持续 end_power_duration_sec 秒结束
+    end_power_w: dict = field(default_factory=lambda: {1: 0.0, 2: 0.0})
+    end_power_duration_sec: int = 30  # 截止判定的持续时长(秒)，功率持续低于阈值该秒数才会话结束
+    unplug_grace_sec: int = 0  # 拔线容错(秒)，0=拔出立即结束；>0=拔出后等待该秒数，期间重新插上则延续同一会话
+    point_interval_sec: int = 30  # 采样间隔(秒)，影响功率图表与充电曲线精度，容量统计不受影响
+
+
+@dataclass
 class Config:
     ble: BLEConfig = field(default_factory=BLEConfig)
     mqtt: MQTTConfig = field(default_factory=MQTTConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     bemfa: BemfaConfig = field(default_factory=BemfaConfig)
+    charge_tracking: ChargeTrackingConfig = field(default_factory=ChargeTrackingConfig)
 
     @property
     def topic_port(self):
@@ -106,6 +119,37 @@ class Config:
     @property
     def topic_charge_event(self):
         return f"{self.mqtt.topic_prefix}/charge_event"
+
+
+def _to_nonneg_float(v):
+    """转非负浮点，非法或负值抛 ValueError。"""
+    try:
+        f = float(v)
+    except (ValueError, TypeError):
+        raise ValueError(f"功率阈值必须为数字: {v}")
+    if f < 0:
+        raise ValueError("功率阈值不能为负")
+    return f
+
+
+def parse_power_thresholds(raw):
+    """解析按端口的功率阈值，返回 {1: v, 2: v}。
+    标量表示两口同值；dict 支持 c1/c2、1/2、"1"/"2" 键，未提及的口为 0。"""
+    result = {1: 0.0, 2: 0.0}
+    if isinstance(raw, dict):
+        for port in (1, 2):
+            if f"c{port}" in raw:
+                v = raw[f"c{port}"]
+            elif port in raw:
+                v = raw[port]
+            elif str(port) in raw:
+                v = raw[str(port)]
+            else:
+                continue
+            result[port] = _to_nonneg_float(v)
+        return result
+    v = _to_nonneg_float(raw)
+    return {1: v, 2: v}
 
 
 def load_config() -> Config:
@@ -180,4 +224,64 @@ def load_config() -> Config:
         modified=bemfa_cfg.get("modified", False),
     )
 
-    return Config(ble=ble, mqtt=mqtt, server=server, bemfa=bemfa)
+    charge_cfg = ycfg.get("charge_tracking", {}) or {}
+
+    # 解析 enabled_ports：仅保留 1/2，过滤掉非法值（如 0、3、4、字符串等）
+    raw_ports = charge_cfg.get("enabled_ports", [1])
+    if not isinstance(raw_ports, list):
+        raw_ports = [raw_ports]
+    enabled_ports = []
+    for p in raw_ports:
+        try:
+            port = int(p)
+        except (ValueError, TypeError):
+            continue
+        if port in (1, 2) and port not in enabled_ports:
+            enabled_ports.append(port)
+    if not enabled_ports:
+        enabled_ports = [1]
+
+    # 解析功率阈值：按端口独立，标量写法表示两口同值，非法/负值当 0 处理
+    try:
+        start_power_w = parse_power_thresholds(charge_cfg.get("start_power_w", 0.0))
+    except ValueError:
+        start_power_w = {1: 0.0, 2: 0.0}
+    try:
+        end_power_w = parse_power_thresholds(charge_cfg.get("end_power_w", 0.0))
+    except ValueError:
+        end_power_w = {1: 0.0, 2: 0.0}
+
+    # 解析 point_interval_sec：最小 1，默认 30
+    try:
+        point_interval_sec = int(charge_cfg.get("point_interval_sec", 30))
+    except (ValueError, TypeError):
+        point_interval_sec = 30
+    if point_interval_sec < 1:
+        point_interval_sec = 30
+
+    # 解析 end_power_duration_sec：最小 1，默认 30
+    try:
+        end_power_duration_sec = int(charge_cfg.get("end_power_duration_sec", 30))
+    except (ValueError, TypeError):
+        end_power_duration_sec = 30
+    if end_power_duration_sec < 1:
+        end_power_duration_sec = 30
+
+    # 解析 unplug_grace_sec：0=关闭容错，默认 0；非法或负值回落 0
+    try:
+        unplug_grace_sec = int(charge_cfg.get("unplug_grace_sec", 0))
+    except (ValueError, TypeError):
+        unplug_grace_sec = 0
+    if unplug_grace_sec < 0:
+        unplug_grace_sec = 0
+
+    charge_tracking = ChargeTrackingConfig(
+        enabled_ports=enabled_ports,
+        start_power_w=start_power_w,
+        end_power_w=end_power_w,
+        end_power_duration_sec=end_power_duration_sec,
+        unplug_grace_sec=unplug_grace_sec,
+        point_interval_sec=point_interval_sec,
+    )
+
+    return Config(ble=ble, mqtt=mqtt, server=server, bemfa=bemfa, charge_tracking=charge_tracking)
