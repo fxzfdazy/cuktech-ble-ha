@@ -40,6 +40,7 @@ Thumbs.db
 
 # Logs
 *.log
+log/
 
 # SQLite database
 *.db

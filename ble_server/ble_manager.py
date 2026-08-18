@@ -1338,11 +1338,13 @@ class BLEManager:
                         lambda t: _LOGGER.error("History write failed: %s", t.exception()) if t.exception() else None)
 
     async def _handle_multiframe(self, data):
-        """Handle multi-frame BLE data. ACK protocol + attempt inline processing.
-        
-        Multi-frame is used for settings batch pushes and large responses.
-        The ACK (RCV_RDY + RCV_OK) is required to keep the BLE channel in sync.
-        Individual frames are also attempted as inline data for robustness.
+        """Handle multi-frame BLE data: ACK 协议 + 拼接子帧 + 解密处理。
+
+        多帧子帧格式为 [frm_lo, frm_hi, data_chunk...]，各子帧的 data_chunk
+        拼接后才是一帧完整的加密 payload。拼接后构造假内联帧头
+        (00 00 02 00) 传给 _try_process_inline_frame，复用其解密与端口推送
+        处理逻辑。旧实现把每个子帧当内联帧（4 字节头）单独解密，偏移错位
+        必然失败。
         """
         if not self.ctrl:
             return
@@ -1355,9 +1357,12 @@ class BLEManager:
                 try:
                     frame = await asyncio.wait_for(
                         self.ctrl.wait_notify("cmd_recv", timeout=3.0), timeout=5.0)
-                    if frame:
-                        await self._try_process_inline_frame(frame)
-                except (asyncio.TimeoutError, Exception) as e:
+                    if not frame:
+                        break
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Multiframe drain stopped at frame %d/%d: timeout", i+1, frame_count)
+                    break
+                except Exception as e:
                     _LOGGER.warning("Multiframe drain stopped at frame %d/%d: %s", i+1, frame_count, e)
                     break
             await self.ctrl.client.write_gatt_char(
@@ -1365,14 +1370,19 @@ class BLEManager:
             return
         await self.ctrl.client.write_gatt_char(
             CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
+        received = b''
         received_count = 0
         for _ in range(frame_count):
             frame = await self.ctrl.wait_notify("cmd_recv", timeout=3.0)
-            if frame:
+            if frame and len(frame) >= 2:
                 received_count += 1
-                await self._try_process_inline_frame(frame)
+                received += frame[2:]
         await self.ctrl.client.write_gatt_char(
             CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x00]), response=False)
+        if received:
+            # 构造假内联帧头，复用 _try_process_inline_frame 的解密与处理逻辑
+            fake_inline = bytes([0x00, 0x00, 0x02, 0x00]) + received
+            await self._try_process_inline_frame(fake_inline)
         if received_count != frame_count:
             _LOGGER.debug("Multiframe: received %d/%d frames", received_count, frame_count)
 

@@ -1012,14 +1012,21 @@ class CuktechBLEController:
             pt = self.decrypt(encrypted_payload)
             return (pt, None) if pt and len(pt) >= 8 else (None, None)
         elif data[2] == 0x00 and len(data) >= 6:
+            # 多帧: 子帧格式 [frm_lo, frm_hi, data_chunk...]，拼接后为完整加密 payload
             frame_count = min(data[4] + 0x100 * data[5], 100)
             await self.client.write_gatt_char(
                 CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
+            received = b''
             for _ in range(frame_count):
-                await self.wait_notify("cmd_recv", timeout=3.0)
+                frame = await self.wait_notify("cmd_recv", timeout=3.0)
+                if frame and len(frame) >= 2:
+                    received += frame[2:]
             await self.client.write_gatt_char(
                 CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x00]), response=False)
-            return None, True
+            if received:
+                pt = self.decrypt(received)
+                return (pt, None) if pt and len(pt) >= 8 else (None, None)
+            return None, None
         return None, None
 
     async def get_properties(self, props):
