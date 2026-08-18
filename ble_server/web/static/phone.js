@@ -60,8 +60,18 @@ const API_PORT_MAP = { 1: 'c1', 2: 'c2', 3: 'c3', 4: 'a' };
 let lastLocalChange = 0;
 function markLocalChange() { lastLocalChange = Date.now(); }
 function isRecentLocal() { return Date.now() - lastLocalChange < 3000; }
-// 端口开关 pending：请求期间该口 enabled 不被服务器状态覆盖，防止慢响应时开关跳回旧值
+// 端口开关 pending：key -> {target, at}。请求期间该口 enabled 不被服务器状态覆盖，
+// 服务器确认到目标值或超过 5 秒未确认时解除并接受服务器状态自愈
 const pendingPortToggles = {};
+function consumePendingToggle(key, serverEnabled) {
+    const p = pendingPortToggles[key];
+    if (!p) return null;
+    if (p.target === serverEnabled || Date.now() - p.at > 5000) {
+        delete pendingPortToggles[key];
+        return null;
+    }
+    return p;
+}
 let state = {
     scene: 1,
     screenTime: 0,
@@ -551,12 +561,21 @@ async function togglePort(key) {
     const on = !state.ports[key].enabled;
     state.ports[key].enabled = on;
     markLocalChange();
-    pendingPortToggles[key] = true;
+    pendingPortToggles[key] = { target: on, at: Date.now() };
     renderAll();
+    let ok = false;
     try {
-        await fetch(`${API_BASE}/api/port`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port: key, action: on ? 'on' : 'off' }) });
+        const res = await fetch(`${API_BASE}/api/port`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port: key, action: on ? 'on' : 'off' }) });
+        const result = await res.json();
+        ok = !!result.ok;
     } catch(e) { console.error(e); }
-    finally { delete pendingPortToggles[key]; }
+    if (!ok) {
+        // 请求失败：解除 pending 并回滚
+        delete pendingPortToggles[key];
+        state.ports[key].enabled = !on;
+        renderAll();
+    }
+    // 成功则保留 pending，待服务器确认到目标值或超时由 consumePendingToggle 解除
 }
 
 async function toggleTrickle() {
@@ -739,7 +758,7 @@ function applyFullStatus(data) {
                     state.ports[key].a = port.current || 0;
                     state.ports[key].w = port.power || 0;
                     state.ports[key].active = port.active === true;
-                    if (!pendingPortToggles[key]) state.ports[key].enabled = port.enabled !== false;
+                    if (!consumePendingToggle(key, port.enabled !== false)) state.ports[key].enabled = port.enabled !== false;
                     state.ports[key].protocol = port.protocol || 'idle';
                     state.ports[key].status_raw = port.status_raw;
                 }
@@ -759,7 +778,7 @@ function applyPortUpdate(portId, portData) {
     state.ports[key].a = portData.current || 0;
     state.ports[key].w = portData.power || 0;
     state.ports[key].active = portData.active === true;
-    if (!pendingPortToggles[key]) state.ports[key].enabled = portData.enabled !== false;
+    if (!consumePendingToggle(key, portData.enabled !== false)) state.ports[key].enabled = portData.enabled !== false;
     state.ports[key].protocol = portData.protocol || 'idle';
     state.ports[key].status_raw = portData.status_raw;
     // 500ms 去抖刷新组合图表（数据到达时及时更新，稳定期由 2s 定时器补充）

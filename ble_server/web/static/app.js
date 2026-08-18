@@ -516,8 +516,8 @@
             const toggle = document.getElementById(`toggle-${PORT_KEY_MAP[portId]}`);
             const portKey = PORT_KEY_MAP[portId];
             const serverEnabled = merged.enabled !== false;
-            if (pendingPortToggles[portKey] === serverEnabled) delete pendingPortToggles[portKey];
-            if (pendingPortToggles.hasOwnProperty(portKey) || isRecent()) {
+            const pending = consumePending(portKey, serverEnabled);
+            if (pending || isRecent()) {
                 if (toggle) card.classList.toggle('active', toggle.checked);
             } else {
                 card.classList.toggle('active', serverEnabled);
@@ -550,8 +550,19 @@
             }
         }
 
-        // 端口开关 pending：key -> 目标状态。请求期间不被服务器状态覆盖，防止慢响应时开关跳回旧值
+        // 端口开关 pending：key -> {target, at}。请求期间不被服务器状态覆盖，防止慢响应时开关跳回旧值
         const pendingPortToggles = {};
+        // 服务器确认到目标值即解除 pending；超过 5 秒未确认视为过期，
+        // 接受服务器状态自愈，避免开关冻结在未被设备采纳的目标态
+        function consumePending(portKey, serverEnabled) {
+            const p = pendingPortToggles[portKey];
+            if (!p) return null;
+            if (p.target === serverEnabled || Date.now() - p.at > 5000) {
+                delete pendingPortToggles[portKey];
+                return null;
+            }
+            return p;
+        }
         let portsRendered = false;
 
         function renderPorts(ports) {
@@ -603,8 +614,8 @@
                 const toggle = document.getElementById(`toggle-${key}`);
                 if (toggle) {
                     // 服务器已确认新状态则解除 pending；pending 期间保持本地目标不被覆盖
-                    if (pendingPortToggles[key] === port.enabled) delete pendingPortToggles[key];
-                    if (!pendingPortToggles.hasOwnProperty(key) && !isRecent() && toggle.checked !== port.enabled) {
+                    const pending = consumePending(key, port.enabled);
+                    if (!pending && !isRecent() && toggle.checked !== port.enabled) {
                         toggle.checked = port.enabled;
                     }
                     card.classList.toggle('active', toggle.checked);
@@ -639,7 +650,7 @@
 
         async function togglePort(port, on) {
             markLocal();
-            pendingPortToggles[port] = on;
+            pendingPortToggles[port] = { target: on, at: Date.now() };
             const toggle = document.getElementById(`toggle-${port}`);
             if (toggle) toggle.disabled = true;
             let ok = false;

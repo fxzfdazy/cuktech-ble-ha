@@ -1013,35 +1013,63 @@ class BLEManager:
     async def _handle_port_command(self, cmd_data, cmd_future):
         port, action = cmd_data
         try:
-            cur = await self.ctrl.send_miot_command(2, 16)
-            cur_val = cur.get("value", 0) if cur else 0
-            if cur is None:
-                _LOGGER.warning('Failed to read port state, using 0')
+            # 请求方已超时放弃（future 被 cancel）则跳过执行，避免设备被
+            # 已回滚的前端继续改写
+            if cmd_future and cmd_future.done():
+                _LOGGER.info("Port command skipped (requester timed out): %s %s", port, action)
+                return
+            # PIID 16 是四个口的开关位掩码，写入前必须有可靠基值。
+            # 基值优先取本地权威状态（每次 SET 后同步更新、settings 轮询刷新），
+            # 仅本地缺失时才向设备读取；读取失败直接报错，绝不按 0 兜底写入，
+            # 否则会把其余正在供电的口全部关掉
+            base = self.state.settings.get("16")
+            if base is None:
+                cur = await self.ctrl.send_miot_command(2, 16)
+                base = cur.get("value") if cur else None
+                if not isinstance(base, int):
+                    _LOGGER.warning("Port command aborted: failed to read PIID 16 (%s %s)", port, action)
+                    if cmd_future and not cmd_future.done():
+                        cmd_future.set_result({"ok": False, "error": "read port state failed"})
+                    return
             if port == "all":
                 new_val = 0x0F if action == "on" else 0x00
             else:
                 bit = PORT_BITS[port]
-                new_val = cur_val | (1 << bit) if action == "on" else cur_val & ~(1 << bit)
-            if new_val != cur_val:
-                await self.ctrl.send_miot_command(2, 16, value=new_val)
-                await self.state.update_settings({"16": new_val})
-                # Emit port state for all changed ports (SSE + MQTT)
-                if port == "all":
-                    for piid in range(1, 5):
-                        if not bool(new_val & (1 << (piid - 1))):
-                            if piid in self._active_sessions:
-                                self._close_session(piid, time.time())
-                            await self.state.update_port(piid, PORT_DEFAULT)
-                        self._emit_port_state(piid)
-                else:
-                    piid = {"c1": 1, "c2": 2, "c3": 3, "a": 4}.get(port)
-                    if piid:
-                        if action == "off":
-                            if piid in self._active_sessions:
-                                self._close_session(piid, time.time())
-                            await self.state.update_port(piid, PORT_DEFAULT)
-                        self._emit_port_state(piid)
-                _invalidate()
+                new_val = base | (1 << bit) if action == "on" else base & ~(1 << bit)
+            res = await self.ctrl.send_miot_command(2, 16, value=new_val)
+            if res is None:
+                if cmd_future and not cmd_future.done():
+                    cmd_future.set_result({"ok": False, "error": "no response"})
+                return
+            # 读回校验：设备确认写入后短暂等待再 GET，若实际值与目标不符
+            # 只告警并刷新状态纠正前端，不做二次盲写
+            await asyncio.sleep(0.3)
+            verify = await self.ctrl.send_miot_command(2, 16)
+            verify_val = verify.get("value") if verify else None
+            if isinstance(verify_val, int) and verify_val != new_val:
+                _LOGGER.warning("Port PIID16 verify mismatch: wrote 0x%02X read 0x%02X (%s %s)",
+                                new_val, verify_val, port, action)
+                await self._refresh_settings()
+                if cmd_future and not cmd_future.done():
+                    cmd_future.set_result({"ok": True, "value": verify_val})
+                return
+            await self.state.update_settings({"16": new_val})
+            # Emit port state for all changed ports (SSE + MQTT)
+            if port == "all":
+                for piid in range(1, 5):
+                    if not bool(new_val & (1 << (piid - 1))):
+                        if piid in self._active_sessions:
+                            self._close_session(piid, time.time())
+                        await self.state.update_port(piid, PORT_DEFAULT)
+                    self._emit_port_state(piid)
+            else:
+                piid = {"c1": 1, "c2": 2, "c3": 3, "a": 4}.get(port)
+                if piid:
+                    if action == "off":
+                        if piid in self._active_sessions:
+                            self._close_session(piid, time.time())
+                        await self.state.update_port(piid, PORT_DEFAULT)
+                    self._emit_port_state(piid)
             _invalidate()
             self._publish_settings(retain=True)
             if cmd_future and not cmd_future.done():
