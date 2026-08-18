@@ -163,8 +163,9 @@ def _estimate_pd_subtype(voltage: float, code: int) -> int:
 
     if voltage < 12.0:
         # 低压段: PPS 极常见 (3-12V 全程覆盖)
-        if round(min_dist, 4) <= 0.05:
-            return 7  # 极精准匹配 PD 标准档位 → PD
+        # 充电头带载 5V 实际输出 5.1V，阈值放宽到 0.1 覆盖带载偏差
+        if round(min_dist, 4) <= 0.1:
+            return 7  # 命中 PD 标准档位 → PD
         return 8      # 默认 PPS
 
     # 高压段 (≥12V): PD 更常见 (PPS 极少超过 15V)
@@ -186,7 +187,12 @@ def estimate_protocol_number(piid: int, raw: RawPortData, pdo_data: Optional[Dic
     """
     key = _cache_key(piid, raw, pdo_data, protocol_switches)
     if hw_protocol is not None and hw_protocol > 0:
-        return hw_protocol  # 硬件协议号不走缓存
+        # 设备 PIID17 协议号可能滞后（PD 快充时仍报 5V）
+        # 当 hw_protocol 表示 5V 但实际电压超过 5V 时不可信，走启发式
+        if hw_protocol in (1, 2) and raw.voltage > 5.5:
+            hw_protocol = None
+        else:
+            return hw_protocol  # 硬件协议号不走缓存
     if key in _proto_cache:
         return _proto_cache[key]
 
